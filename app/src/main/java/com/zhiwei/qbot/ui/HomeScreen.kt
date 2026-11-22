@@ -16,6 +16,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -25,7 +29,12 @@ import androidx.compose.ui.unit.sp
 import com.zhiwei.qbot.bot.BotService
 import com.zhiwei.qbot.bot.Runtime
 import com.zhiwei.qbot.core.Prefs
+import com.zhiwei.qbot.net.AiApi
+import com.zhiwei.qbot.net.QqApi
 import com.zhiwei.qbot.util.KeepAlive
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private fun stateColor(state: Runtime.State) = when (state) {
     Runtime.State.ONLINE -> Green
@@ -47,6 +56,9 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
     val cfg by Prefs.state.collectAsState()
     val snap by Runtime.snap.collectAsState()
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var checking by remember { mutableStateOf(false) }
+    var checkText by remember { mutableStateOf<String?>(null) }
     val running = snap.state == Runtime.State.ONLINE ||
         snap.state == Runtime.State.CONNECTING ||
         snap.state == Runtime.State.RECONNECTING
@@ -119,6 +131,34 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
                     }
                 }
                 Ghost("测试对话", onClick = onTalk)
+                Ghost(if (checking) "自检中…" else "一键自检", onClick = {
+                    if (checking) return@Ghost
+                    checking = true
+                    scope.launch {
+                        val sb = StringBuilder()
+                        val token = withContext(Dispatchers.IO) { runCatching { QqApi.accessToken(force = true) } }
+                        sb.append(if (token.isSuccess) "✓ 机器人凭证\n" else "✗ 凭证：${token.exceptionOrNull()?.message}\n")
+                        val gw = withContext(Dispatchers.IO) { runCatching { QqApi.gatewayUrl() } }
+                        sb.append(if (gw.isSuccess) "✓ 网关地址\n" else "✗ 网关：${gw.exceptionOrNull()?.message}\n")
+                        val ai = withContext(Dispatchers.IO) {
+                            runCatching {
+                                AiApi.chat(
+                                    listOf(
+                                        AiApi.Msg("system", "只回一个字：好"),
+                                        AiApi.Msg("user", "在吗")
+                                    ),
+                                    Prefs.current.ai
+                                )
+                            }
+                        }
+                        sb.append(if (ai.isSuccess) "✓ 模型接口\n" else "✗ 模型：${ai.exceptionOrNull()?.message}\n")
+                        sb.append(if (KeepAlive.ignoringBattery(ctx)) "✓ 电池白名单\n" else "✗ 电池白名单未开\n")
+                        sb.append(if (KeepAlive.notificationsEnabled(ctx)) "✓ 通知权限\n" else "✗ 通知权限未开\n")
+                        sb.append(if (KeepAlive.hasAllFiles()) "✓ 文件权限\n" else "△ 文件权限未开（只影响发图）")
+                        checking = false
+                        checkText = sb.toString()
+                    }
+                })
             }
             if (running) {
                 Hint("后台常驻已开启。把应用加入电池白名单会更稳。")
@@ -148,6 +188,16 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
             fontSize = 10.sp,
             color = TextDim,
             modifier = Modifier.padding(top = 18.dp, start = 4.dp)
+        )
+    }
+
+    checkText?.let { text ->
+        SimpleDialog(
+            title = "自检结果",
+            text = text,
+            confirm = "知道了",
+            onConfirm = { checkText = null },
+            onDismiss = { checkText = null }
         )
     }
 }
