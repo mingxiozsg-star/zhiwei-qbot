@@ -272,7 +272,7 @@ object Brain {
         }
     }
 
-    private fun replyWithAi(conv: Conversation, text: String, senderId: String, senderName: String) {
+    private suspend fun replyWithAi(conv: Conversation, text: String, senderId: String, senderName: String) {
         val cfg = Prefs.current
         val key = convKey(conv)
         val messages = buildMessages(cfg, key, text, senderName, conv.isGroup)
@@ -340,7 +340,7 @@ object Brain {
         return out
     }
 
-    private fun deliver(conv: Conversation, rawReply: String, cfg: Config) {
+    private suspend fun deliver(conv: Conversation, rawReply: String, cfg: Config) {
         val pieces = parsePieces(rawReply)
         var totalSent = 0
         val maxTotal = 8

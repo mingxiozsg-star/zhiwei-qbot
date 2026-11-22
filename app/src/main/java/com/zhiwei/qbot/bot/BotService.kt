@@ -64,6 +64,7 @@ class BotService : Service() {
     private var gateway: Gateway? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var stateJob: Job? = null
+    private var foreground = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -161,12 +162,13 @@ class BotService : Service() {
             } else {
                 startForeground(NOTIFY_ID, n)
             }
+            foreground = true
         }.onFailure { Logs.e("前台通知失败：${it.message}") }
         Logs.i("前台服务：$text")
     }
 
     private fun updateNotification() {
-        if (!isForeground) return
+        if (!foreground) return
         runCatching {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.notify(NOTIFY_ID, buildNotification())
@@ -176,6 +178,7 @@ class BotService : Service() {
     private fun stopEverything() {
         gateway?.stop()
         gateway = null
+        foreground = false
         releaseWakeLock()
         stateJob?.cancel()
         scope.cancel()

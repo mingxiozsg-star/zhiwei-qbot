@@ -102,7 +102,7 @@ fun ActionRow(title: String, desc: String = "", trailing: String = "›", onClic
 }
 
 @Composable
-fun Primary(text: String, onClick: () -> Unit, enabled: Boolean = true, modifier: Modifier = Modifier) {
+fun Primary(text: String, enabled: Boolean = true, modifier: Modifier = Modifier, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         enabled = enabled,
@@ -115,7 +115,7 @@ fun Primary(text: String, onClick: () -> Unit, enabled: Boolean = true, modifier
 }
 
 @Composable
-fun Ghost(text: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun Ghost(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
     OutlinedButton(
         onClick = onClick,
         shape = RoundedCornerShape(14.dp),
@@ -128,7 +128,7 @@ fun Ghost(text: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun TinyBtn(text: String, onClick: () -> Unit, color: Color = Cyan) {
+fun TinyBtn(text: String, color: Color = Cyan, onClick: () -> Unit) {
     Text(
         text,
         color = color,
