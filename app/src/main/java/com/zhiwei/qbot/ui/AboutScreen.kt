@@ -28,6 +28,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.zhiwei.qbot.bot.Brain
+import com.zhiwei.qbot.core.AppInfo
 import com.zhiwei.qbot.core.Prefs
 
 /** 关于：版本、开源、配置的搬进搬出。 */
@@ -42,8 +43,8 @@ fun AboutScreen(onBack: () -> Unit) {
 
     val version = remember {
         runCatching {
-            ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "1.0.0"
-        }.getOrDefault("1.0.0")
+            ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: AppInfo.VERSION
+        }.getOrDefault(AppInfo.VERSION)
     }
 
     Page(title = "关于", subtitle = "v$version", onBack = onBack) {
@@ -60,8 +61,12 @@ fun AboutScreen(onBack: () -> Unit) {
 
         SectionTitle("开源")
         CardBox {
-            ActionRow("GitHub 仓库", "github.com/mingxiozsg-star") {
-                openUrl(ctx, "https://github.com/mingxiozsg-star")
+            ActionRow("GitHub 仓库", AppInfo.REPO.removePrefix("https://")) {
+                openUrl(ctx, AppInfo.REPO)
+            }
+            Line()
+            ActionRow("更新日志", "每个版本改了什么") {
+                openUrl(ctx, AppInfo.REPO + "/releases")
             }
             Line()
             ActionRow("QQ 开放平台", "机器人后台、文档、额度") {

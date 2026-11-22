@@ -6,7 +6,42 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.Locale
 import java.util.UUID
+
+/**
+ * 媒体类型：决定上传时用哪个 file_type。
+ * 平台定义：1 图片 / 2 视频 / 3 语音(silk) / 4 文件。
+ */
+enum class MediaKind(val fileType: Int, val label: String) {
+    IMAGE(1, "图片"),
+    VIDEO(2, "视频"),
+    VOICE(3, "语音"),
+    PLAIN(4, "文件");
+
+    companion object {
+        private val images = setOf("png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif")
+        private val videos = setOf("mp4", "mov", "m4v", "avi", "mkv", "webm", "flv", "3gp", "ts")
+        private val voices = setOf("silk", "slk")
+
+        fun of(name: String): MediaKind {
+            val ext = name.substringAfterLast('.', "").lowercase()
+            return when {
+                ext in images -> IMAGE
+                ext in videos -> VIDEO
+                ext in voices -> VOICE
+                else -> PLAIN
+            }
+        }
+
+        fun fromFileType(type: Int): MediaKind = when (type) {
+            1 -> IMAGE
+            2 -> VIDEO
+            3 -> VOICE
+            else -> PLAIN
+        }
+    }
+}
 
 /**
  * 本地素材：表情包文件、临时音频/图片。全部放应用私有目录，不污染相册。
@@ -53,8 +88,18 @@ object Store {
     fun readBytes(path: String, limitMb: Int = 16): ByteArray {
         val f = File(path)
         require(f.exists()) { "文件不存在：$path" }
-        require(f.length() <= limitMb * 1024L * 1024L) { "文件超过 ${limitMb}MB，先别发" }
+        require(f.isFile) { "这不是文件：$path" }
+        require(f.canRead()) { "读不到文件（可能缺「所有文件访问」权限）：$path" }
+        require(f.length() <= limitMb * 1024L * 1024L) {
+            "文件 ${sizeText(f.length())} 超过上限 ${limitMb}MB"
+        }
         return f.readBytes()
+    }
+
+    fun sizeText(bytes: Long): String = when {
+        bytes < 1024 -> "${bytes}B"
+        bytes < 1024 * 1024 -> String.format(Locale.US, "%.1fKB", bytes / 1024.0)
+        else -> String.format(Locale.US, "%.1fMB", bytes / 1048576.0)
     }
 
     fun guessMime(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
@@ -69,8 +114,13 @@ object Store {
         "txt", "log", "json", "md" -> "text/plain"
         "pdf" -> "application/pdf"
         "zip" -> "application/zip"
+        "apk" -> "application/vnd.android.package-archive"
         else -> "application/octet-stream"
     }
+
+    /** 会动的格式（gif/webp）不要重新编码，否则动画就没了 */
+    fun animatedImage(name: String): Boolean =
+        name.substringAfterLast('.', "").lowercase() in setOf("gif", "webp")
 
     /** 图片超过 1280px 就先压一遍，减少上传体积与失败率 */
     fun compressImage(bytes: ByteArray, maxSide: Int = 1280): ByteArray {

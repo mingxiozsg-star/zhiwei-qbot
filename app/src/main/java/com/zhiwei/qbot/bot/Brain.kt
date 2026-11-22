@@ -12,30 +12,55 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 
 /**
  * 消息大脑：事件 -> 指令 or AI -> 分句 -> 发出去。
- * 所有耗时动作都在 IO 协程里，网关线程不会被堵住。
+ *
+ * 稳定性约定：
+ * 1. 同一会话串行处理（Mutex），并发消息不会把被动回复次数搅乱；
+ * 2. 全局同时最多 4 个模型请求（Semaphore），避免手机端打爆接口；
+ * 3. 模型请求失败自动重试 3 次（指数退避），全失败才回一句人话；
+ * 4. 发送流程整体 try/catch，单条消息出错不影响下一条。
  */
 object Brain {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val histories = LinkedHashMap<String, MutableList<AiApi.Msg>>()
     private val historyLock = Any()
+    private val convLocks = ConcurrentHashMap<String, Mutex>()
+    private val aiGate = Semaphore(4)
+
+    /** 由 BotService 注入：/重连 时真正重建网关 */
+    var reconnectHook: (() -> Unit)? = null
 
     fun onDispatch(type: String, d: JSONObject) {
         when (type) {
             "GROUP_AT_MESSAGE_CREATE" -> {
                 val conv = Conversation(true, d.optString("group_openid"), d.optString("id"))
                 val author = d.optJSONObject("author")
-                handleMessage(conv, d.optString("content"), author?.optString("member_openid") ?: "", author?.optString("member_name") ?: "群友")
+                handleMessage(
+                    conv,
+                    d.optString("content"),
+                    author?.optString("member_openid") ?: "",
+                    author?.optString("member_name") ?: "群友"
+                )
             }
             "C2C_MESSAGE_CREATE" -> {
                 val author = d.optJSONObject("author")
                 val conv = Conversation(false, author?.optString("user_openid") ?: "", d.optString("id"))
-                handleMessage(conv, d.optString("content"), author?.optString("user_openid") ?: "", author?.optString("username") ?: "对方")
+                handleMessage(
+                    conv,
+                    d.optString("content"),
+                    author?.optString("user_openid") ?: "",
+                    author?.optString("username") ?: "对方"
+                )
             }
             "AT_MESSAGE_CREATE" -> Logs.i("频道消息暂不处理（本工具只接群聊与单聊）")
             "INTERACTION_CREATE" -> handleInteraction(d)
@@ -54,17 +79,29 @@ object Brain {
             .replace(Regex("\\s+"), " ")
             .trim()
 
+    /** 同一会话一把锁，避免两句并发把上下文和 msg_seq 搅在一起 */
+    private fun lockFor(key: String): Mutex {
+        if (convLocks.size > 80) convLocks.clear()
+        return convLocks.computeIfAbsent(key) { Mutex() }
+    }
+
     private fun handleMessage(conv: Conversation, raw: String, senderId: String, senderName: String) {
         if (conv.openId.isBlank()) return
         val text = clean(raw)
         if (text.isBlank()) return
         Logs.i("[${if (conv.isGroup) "群" else "私聊"}] ${senderName.ifBlank { "某人" }}：${text.take(60)}")
         scope.launch {
-            if (routeCommand(text, conv, senderId, senderName)) return@launch
-            val cfg = Prefs.current
-            if (conv.isGroup && !cfg.aiGroup) return@launch
-            if (!conv.isGroup && !cfg.aiC2c) return@launch
-            replyWithAi(conv, text, senderId, senderName)
+            lockFor(convKey(conv)).withLock {
+                try {
+                    if (routeCommand(text, conv, senderId, senderName)) return@withLock
+                    val cfg = Prefs.current
+                    if (conv.isGroup && !cfg.aiGroup) return@withLock
+                    if (!conv.isGroup && !cfg.aiC2c) return@withLock
+                    replyWithAi(conv, text, senderId, senderName)
+                } catch (e: Exception) {
+                    Logs.e("处理消息出错：${e.message}")
+                }
+            }
         }
     }
 
@@ -81,11 +118,17 @@ object Brain {
         Logs.i("按钮回调：${command.ifBlank { "(空)" }}")
         if (command.isBlank()) return
         scope.launch {
-            if (routeCommand(command, conv, userOpenId, "", true)) return@launch
-            val cfg = Prefs.current
-            if (isGroup && !cfg.aiGroup) return@launch
-            if (!isGroup && !cfg.aiC2c) return@launch
-            replyWithAi(conv, command, userOpenId, "群友")
+            lockFor(convKey(conv)).withLock {
+                try {
+                    if (routeCommand(command, conv, userOpenId, "", true)) return@withLock
+                    val cfg = Prefs.current
+                    if (isGroup && !cfg.aiGroup) return@withLock
+                    if (!isGroup && !cfg.aiC2c) return@withLock
+                    replyWithAi(conv, command, userOpenId, "群友")
+                } catch (e: Exception) {
+                    Logs.e("处理按钮回调出错：${e.message}")
+                }
+            }
         }
     }
 
@@ -109,11 +152,6 @@ object Brain {
             .filter { it.isNotEmpty() }
         if (owners.isEmpty()) return true
         return owners.any { it == senderId }
-    }
-
-    private fun allowedAi(conv: Conversation): Boolean {
-        val cfg = Prefs.current
-        return if (conv.isGroup) cfg.aiGroup else cfg.aiC2c
     }
 
     private fun routeCommand(
@@ -170,6 +208,20 @@ object Brain {
                 Sender.sendText(conv, "配置已重载。")
                 return true
             }
+            lower == "/重连" -> {
+                if (!isOwner(senderId)) {
+                    Sender.sendText(conv, "重连只有管理员能动。")
+                    return true
+                }
+                val hook = reconnectHook
+                if (hook == null) {
+                    Sender.sendText(conv, "机器人没在跑，先在应用里点启动。")
+                } else {
+                    hook.invoke()
+                    Sender.sendText(conv, "已断开重连。")
+                }
+                return true
+            }
             lower.startsWith("/语音") -> {
                 if (!isOwner(senderId)) {
                     Sender.sendText(conv, "语音只有管理员能点。")
@@ -194,23 +246,31 @@ object Brain {
                 if (sticker == null) Sender.sendText(conv, "没找到这个表情。") else scope.launch { Sender.sendSticker(conv, sticker) }
                 return true
             }
-            lower.startsWith("/文件") -> {
-                if (!isOwner(senderId)) {
+            lower.startsWith("/文件") || lower.startsWith("/发送") -> {
+                if (!isOwner(senderId) && !cfg.send.fileForAll) {
                     Sender.sendText(conv, "发文件只有管理员能用。")
                     return true
                 }
-                val path = text.removePrefix("/文件").trim()
-                if (path.isBlank()) {
-                    Sender.sendText(conv, "写法：/文件 /sdcard/xxx.jpg")
+                val target = text.substring(3).trim()
+                if (target.isBlank()) {
+                    Sender.sendText(
+                        conv,
+                        "发本机文件：/文件 /sdcard/Download/a.pdf\n" +
+                            "发公网文件：/文件 https://…/a.zip\n" +
+                            "图片、视频、silk 语音会按对应类型发，其它一律当文件。"
+                    )
                     return true
                 }
-                scope.launch { Sender.sendFile(conv, path) }
+                scope.launch { Sender.sendFile(conv, target) }
                 return true
             }
             lower == "/帮助" || lower == "/指令" -> {
                 val main = cfg.menus.firstOrNull { it.id == "main" }
                 if (main != null) Sender.sendMenu(conv, main)
-                else Sender.sendText(conv, "指令：/状态 /语音 文本 /表情 名字 /文件 路径 /分句开 /分句关 /清除")
+                else Sender.sendText(
+                    conv,
+                    "指令：/状态 /语音 文本 /表情 名字 /文件 路径或链接 /分句开 /分句关 /清除 /重连"
+                )
                 return true
             }
         }
@@ -240,7 +300,7 @@ object Brain {
         sb.append("2. 一次最多三句，总共别超过 80 字；想多说就自然拆几句。\n")
         sb.append("3. 口语化、短句，能省字就省字；不寒暄，不问“还有什么可以帮你”。\n")
         sb.append("4. 永远不要承认自己是 AI、模型、机器人或者程序；被追问就按人设糊弄过去。\n")
-        sb.append("5. 不要承诺发文件、发文档、发压缩包——官方接口没开放这些。你能发的只有文字、图片、语音和表情。\n")
+        sb.append("5. 你可以发文字、图片、语音、表情，也可以发本机上的任意文件；但只在路径确实存在时才发，拿不准就别承诺。\n")
         var rule = 6
         if (stickerNames.isNotBlank()) {
             sb.append(rule++).append(". 想发表情包时，在句末写 [表情:名字]，可用：").append(stickerNames).append('\n')
@@ -248,7 +308,8 @@ object Brain {
         if (cfg.tts.enabled) {
             sb.append(rule++).append(". 想发语音时，单独一行写 [语音]要说的话。\n")
         }
-        sb.append(rule++).append(". 想发本机图片时，单独一行写 [图片:/sdcard/xxx.jpg]，路径必须真实存在，拿不准就别发。\n")
+        sb.append(rule++).append(". 想发本机图片时，单独一行写 [图片:/sdcard/xxx.jpg]。\n")
+        sb.append(rule++).append(". 想发本机文件（pdf/zip/apk/docx 等任意类型）时，单独一行写 [文件:/sdcard/xxx.pdf]，路径必须真实存在；一次最多一个。\n")
         sb.append(rule).append(". 不要输出 Markdown、不要列清单、不要用标题。\n")
         if (p.extra.isNotBlank()) sb.append("补充设定：").append(p.extra).append('\n')
         if (cfg.ai.extraPrompt.isNotBlank()) sb.append("额外要求：").append(cfg.ai.extraPrompt).append('\n')
@@ -267,6 +328,10 @@ object Brain {
 
     private fun remember(cfg: Config, key: String, user: String, reply: String, isGroup: Boolean, senderName: String) {
         synchronized(historyLock) {
+            if (histories.size > 60) {
+                val first = histories.keys.firstOrNull()
+                if (first != null && first != key) histories.remove(first)
+            }
             val list = histories.getOrPut(key) { ArrayList() }
             list.add(AiApi.Msg("user", if (isGroup) "${senderName.ifBlank { "群友" }}：$user" else user))
             list.add(AiApi.Msg("assistant", reply))
@@ -282,24 +347,31 @@ object Brain {
         val started = System.currentTimeMillis()
         var reply: String? = null
         var lastError = ""
-        for (attempt in 1..2) {
-            try {
-                reply = AiApi.chat(messages, cfg.ai)
-                break
-            } catch (e: Exception) {
-                lastError = e.message ?: "未知错误"
-                Logs.w("模型调用失败（$attempt/2）：$lastError")
-                if (attempt == 1) delay(1200)
+        aiGate.withPermit {
+            for (attempt in 1..3) {
+                try {
+                    reply = AiApi.chat(messages, cfg.ai)
+                    return@withPermit
+                } catch (e: Exception) {
+                    lastError = e.message ?: "未知错误"
+                    Logs.w("模型调用失败（$attempt/3）：$lastError")
+                    if (attempt < 3) delay(900L * attempt + Random.nextLong(0, 500))
+                }
             }
         }
-        if (reply == null) {
+        val answer = reply
+        if (answer == null) {
             Logs.e("模型最终失败：$lastError")
             Sender.sendText(conv, "等一下，脑子卡了一下。")
             return
         }
-        Logs.i("模型 ${System.currentTimeMillis() - started}ms 返回 ${reply.length} 字")
-        remember(cfg, key, text, reply, conv.isGroup, senderName)
-        deliver(conv, reply, cfg)
+        Logs.i("模型 ${System.currentTimeMillis() - started}ms 返回 ${answer.length} 字")
+        remember(cfg, key, text, answer, conv.isGroup, senderName)
+        try {
+            deliver(conv, answer, cfg, senderId)
+        } catch (e: Exception) {
+            Logs.e("发送流程出错：${e.message}")
+        }
     }
 
     /* ---------------- 出站 ---------------- */
@@ -343,7 +415,7 @@ object Brain {
         return out
     }
 
-    private suspend fun deliver(conv: Conversation, rawReply: String, cfg: Config) {
+    private suspend fun deliver(conv: Conversation, rawReply: String, cfg: Config, senderId: String) {
         val pieces = parsePieces(rawReply)
         var totalSent = 0
         val maxTotal = 8
@@ -389,9 +461,13 @@ object Brain {
                     totalSent++
                 }
                 is Piece.FilePiece -> {
-                    if (isOwner(conv.openId) || Prefs.current.owners.isBlank()) Sender.sendFile(conv, piece.path)
-                    else Logs.w("非管理员请求发文件，已忽略：${piece.path}")
+                    if (isOwner(senderId) || Prefs.current.send.fileForAll) {
+                        Sender.sendFile(conv, piece.path)
+                    } else {
+                        Logs.w("非管理员请求发文件，已忽略：${piece.path}")
+                    }
                     totalSent++
+                    delay(500)
                 }
             }
         }

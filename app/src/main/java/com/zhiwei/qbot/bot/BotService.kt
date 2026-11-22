@@ -22,6 +22,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -30,12 +31,16 @@ import kotlinx.coroutines.launch
  * 前台服务承载网关。specialUse 类型是刻意选的：
  * dataSync 在 Android 15 起有 6 小时/天的限制，且不允许开机自启拉起，
  * 而长期在线的机器人连接属于特殊用途，用 specialUse 才能稳定常驻。
+ *
+ * 这一版加了守护协程：网关不在了就自己拉起来，状态卡死就重连，
+ * 不用等用户手动点。
  */
 class BotService : Service() {
 
     companion object {
         const val ACTION_START = "com.zhiwei.qbot.START"
         const val ACTION_STOP = "com.zhiwei.qbot.STOP"
+        const val ACTION_RECONNECT = "com.zhiwei.qbot.RECONNECT"
         private const val CHANNEL = "qbot_running"
         private const val NOTIFY_ID = 1001
 
@@ -58,13 +63,22 @@ class BotService : Service() {
                 context.stopService(Intent(context, BotService::class.java))
             }
         }
+
+        fun reconnect(context: Context) {
+            runCatching {
+                context.startService(Intent(context, BotService::class.java).setAction(ACTION_RECONNECT))
+            }.onFailure { Logs.e("重连指令没发出去：${it.message}") }
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var gateway: Gateway? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var stateJob: Job? = null
+    private var guardJob: Job? = null
     private var foreground = false
+
+    @Volatile private var stopping = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -72,18 +86,35 @@ class BotService : Service() {
         super.onCreate()
         createChannel()
         goForeground("正在启动…")
+        Brain.reconnectHook = { reconnectGateway("应用内请求") }
         stateJob = scope.launch {
             Runtime.snap.map { it.state }.distinctUntilChanged().collect { updateNotification() }
+        }
+        guardJob = scope.launch {
+            while (!stopping) {
+                delay(45_000)
+                if (stopping) break
+                keepAliveCheck()
+            }
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            Logs.i("收到停止指令")
-            stopEverything()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                Logs.i("收到停止指令")
+                stopEverything()
+                return START_NOT_STICKY
+            }
+            ACTION_RECONNECT -> {
+                reconnectGateway("通知栏/应用请求")
+                return START_STICKY
+            }
+            else -> {
+                stopping = false
+                ensureRunning()
+            }
         }
-        ensureRunning()
         return START_STICKY
     }
 
@@ -96,10 +127,44 @@ class BotService : Service() {
             return
         }
         Runtime.setState(Runtime.State.CONNECTING, "启动中")
+        gateway?.stop()
         gateway = Gateway { type, data -> Brain.onDispatch(type, data) }.also { it.start(scope) }
         if (cfg.wakeLock) acquireWakeLock()
         updateNotification()
         Logs.i("服务已启动")
+    }
+
+    /** 守护检查：网关死了就重建；重连卡太久也重建 */
+    private fun keepAliveCheck() {
+        if (stopping) return
+        val cfg = Prefs.current
+        if (cfg.appId.isBlank() || cfg.appSecret.isBlank()) return
+        val g = gateway
+        val snap = Runtime.snap.value
+        when {
+            g == null || !g.isRunning() -> {
+                Logs.w("守护：网关没在跑，重新拉起")
+                ensureRunning()
+            }
+            snap.state == Runtime.State.RECONNECTING &&
+                System.currentTimeMillis() - snap.since > 5 * 60_000L -> {
+                Logs.w("守护：重连超过 5 分钟，重建连接")
+                reconnectGateway("重连超时")
+            }
+            snap.state == Runtime.State.STOPPED -> {
+                Logs.w("守护：状态是已停止但服务还在，重新连接")
+                Runtime.setState(Runtime.State.CONNECTING, "重新连接")
+                reconnectGateway("状态复位")
+            }
+        }
+    }
+
+    private fun reconnectGateway(reason: String) {
+        Logs.i("重建网关：$reason")
+        val old = gateway
+        gateway = null
+        old?.stop()
+        ensureRunning()
     }
 
     private fun acquireWakeLock() {
@@ -141,6 +206,12 @@ class BotService : Service() {
             Intent(this, BotService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val reconnectIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, BotService::class.java).setAction(ACTION_RECONNECT),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         return NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_bot)
             .setContentTitle(snap.botName.ifBlank { Prefs.current.persona.name } + " · " + snap.detail)
@@ -150,6 +221,7 @@ class BotService : Service() {
             .setShowWhen(false)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(open)
+            .addAction(0, "重连", reconnectIntent)
             .addAction(0, "停止", stopIntent)
             .build()
     }
@@ -176,21 +248,34 @@ class BotService : Service() {
     }
 
     private fun stopEverything() {
+        stopping = true
         gateway?.stop()
         gateway = null
         foreground = false
         releaseWakeLock()
+        Brain.reconnectHook = null
         stateJob?.cancel()
+        guardJob?.cancel()
         scope.cancel()
         Runtime.stop()
-        runCatching { stopForeground(true) }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        }
         stopSelf()
     }
 
     override fun onDestroy() {
+        stopping = true
+        guardJob?.cancel()
         runCatching { gateway?.stop() }
         gateway = null
         releaseWakeLock()
+        Brain.reconnectHook = null
         Runtime.stop()
         super.onDestroy()
     }

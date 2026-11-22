@@ -17,6 +17,8 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
 
@@ -24,17 +26,19 @@ import kotlin.random.Random
  * QQ 官方机器人 WebSocket 网关。
  *
  * 稳定性策略：
- * 1. 心跳按服务端下发的 interval 发，超时未 ACK 直接重连；
- * 2. 断线指数退避（1/2/4/8/16/30 秒）并带抖动，避免同时重连；
- * 3. 连续失败后自动切备用网关；
- * 4. op7 / op9 单独处理，token 失效自动刷新；
- * 5. 全局只有一个连接与一个心跳协程，后台开销极小。
+ * 1. 心跳按服务端下发的 interval 发，op11 与任何下行帧都算 ACK；
+ * 2. 独立看门狗：长时间收不到任何数据就强制重连（心跳协程死了也能兜住）；
+ * 3. 断线指数退避（1/2/4/8/16/30 秒）带抖动，连续失败切备用网关；
+ * 4. 只认「当前这把 socket」的回调，旧连接的 onFailure 不会把新连接踩掉；
+ * 5. op7 / op9 单独处理，op9 自动刷新 token；续连失败自动回到全新鉴权。
  */
 class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
 
     private var scope: CoroutineScope? = null
     private var socket: WebSocket? = null
     private var hbJob: Job? = null
+    private var watchJob: Job? = null
+    private val opening = AtomicBoolean(false)
 
     @Volatile private var running = false
     @Volatile private var lastSeq: Int = 0
@@ -45,6 +49,7 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
     @Volatile private var lastReconnectAt: Long = 0L
     @Volatile private var sessionId: String = ""
     @Volatile private var resumeUrl: String = ""
+    @Volatile private var intervalMs: Long = 41_250L
 
     fun isRunning(): Boolean = running
 
@@ -55,7 +60,9 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
         stopping = false
         attempt = 0
         lastSeq = 0
+        lastAck = System.currentTimeMillis()
         open()
+        startWatchdog()
     }
 
     fun stop() {
@@ -63,6 +70,8 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
         stopping = true
         hbJob?.cancel()
         hbJob = null
+        watchJob?.cancel()
+        watchJob = null
         runCatching { socket?.close(1000, "bye") }
         socket = null
         Runtime.setState(Runtime.State.STOPPED, "已停止")
@@ -76,6 +85,7 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
     private fun open() {
         if (!running) return
         val s = scope ?: return
+        if (!opening.compareAndSet(false, true)) return
         s.launch(Dispatchers.IO) {
             try {
                 Runtime.setState(
@@ -99,6 +109,8 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
             } catch (e: Exception) {
                 Logs.e("取网关失败：${e.message}")
                 reconnect("取网关失败")
+            } finally {
+                opening.set(false)
             }
         }
     }
@@ -106,7 +118,12 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
     private val listener = object : WebSocketListener() {
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (!running || webSocket !== socket) {
+                runCatching { webSocket.close(1000, "stale") }
+                return
+            }
             try {
+                lastAck = System.currentTimeMillis()
                 val token = QqApi.accessToken()
                 if (sessionId.isNotBlank() && lastSeq > 0) {
                     val resume = JSONObject()
@@ -143,6 +160,7 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (webSocket !== socket) return
             lastAck = System.currentTimeMillis()
             try {
                 val json = JSONObject(text)
@@ -150,8 +168,9 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
                 when (json.num("op", -1)) {
                     10 -> {
                         val interval = json.obj("d").num("heartbeat_interval", 41250).toLong()
-                        Logs.i("心跳间隔 ${interval}ms")
-                        startHeartbeat(interval)
+                        intervalMs = interval.coerceIn(5_000L, 120_000L)
+                        Logs.i("心跳间隔 ${intervalMs}ms")
+                        startHeartbeat(intervalMs)
                     }
                     11 -> Unit
                     0 -> {
@@ -194,12 +213,15 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            opening.set(false)
+            if (webSocket !== socket) return
             if (stopping) return
             Logs.w("WebSocket 断开：${t.message}")
             reconnect("连接断开")
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (webSocket !== socket) return
             if (stopping) return
             if (code != 1000) {
                 Logs.w("WebSocket 关闭：$code $reason")
@@ -231,6 +253,24 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
         }
     }
 
+    /** 独立看门狗：心跳协程本身挂了、或者半死不活时，这条兜底 */
+    private fun startWatchdog() {
+        watchJob?.cancel()
+        val s = scope ?: return
+        watchJob = s.launch(Dispatchers.IO) {
+            while (running) {
+                delay(20_000)
+                if (!running) break
+                if (currentUrl.isBlank()) continue
+                val gap = System.currentTimeMillis() - lastAck
+                val limit = max(intervalMs * 2 + 30_000, 150_000)
+                if (gap > limit) {
+                    reconnect("看门狗：${gap / 1000}s 没有数据")
+                }
+            }
+        }
+    }
+
     private fun reconnect(reason: String) {
         if (!running) return
         val now = System.currentTimeMillis()
@@ -238,8 +278,9 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
         lastReconnectAt = now
         hbJob?.cancel()
         hbJob = null
-        runCatching { socket?.cancel() }
+        val old = socket
         socket = null
+        runCatching { old?.cancel() }
         attempt += 1
         Runtime.setState(Runtime.State.RECONNECTING, reason)
         Runtime.fail()

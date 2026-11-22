@@ -151,7 +151,13 @@ data class SendConfig(
     val typingSim: Boolean = true,
     val passiveReply: Boolean = true,
     val attachMenu: Boolean = false,
-    val atSender: Boolean = false
+    val atSender: Boolean = false,
+    /** 允许发普通文件（file_type=4）；关掉后只发图片/视频/语音 */
+    val allowPlainFile: Boolean = true,
+    /** 普通文件也开放给非管理员 */
+    val fileForAll: Boolean = false,
+    /** 单个文件上限（MB），base64 上传的内存天花板 */
+    val fileMaxMb: Int = 10
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("split", split)
@@ -163,6 +169,9 @@ data class SendConfig(
         .put("passiveReply", passiveReply)
         .put("attachMenu", attachMenu)
         .put("atSender", atSender)
+        .put("allowPlainFile", allowPlainFile)
+        .put("fileForAll", fileForAll)
+        .put("fileMaxMb", fileMaxMb)
 
     companion object {
         fun from(o: JSONObject) = SendConfig(
@@ -174,7 +183,10 @@ data class SendConfig(
             typingSim = o.flag("typingSim", true),
             passiveReply = o.flag("passiveReply", true),
             attachMenu = o.flag("attachMenu"),
-            atSender = o.flag("atSender")
+            atSender = o.flag("atSender"),
+            allowPlainFile = o.flag("allowPlainFile", true),
+            fileForAll = o.flag("fileForAll"),
+            fileMaxMb = o.num("fileMaxMb", 10)
         )
     }
 }

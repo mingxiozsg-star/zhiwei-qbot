@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.zhiwei.qbot.bot.BotService
 import com.zhiwei.qbot.bot.Runtime
+import com.zhiwei.qbot.core.AppInfo
 import com.zhiwei.qbot.core.Prefs
 import com.zhiwei.qbot.net.AiApi
 import com.zhiwei.qbot.net.QqApi
@@ -63,7 +64,7 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
         snap.state == Runtime.State.CONNECTING ||
         snap.state == Runtime.State.RECONNECTING
 
-    Page(title = "知微 QQ 机器人", subtitle = "v1.0.0 · 本地常驻 · 官方接口") {
+    Page(title = "知微 QQ 机器人", subtitle = "v${AppInfo.VERSION} · 本地常驻 · 官方接口") {
         if (cfg.appId.isBlank() || cfg.appSecret.isBlank() || cfg.ai.apiKey.isBlank()) {
             Surface(
                 shape = RoundedCornerShape(18.dp),
@@ -154,7 +155,7 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
                         sb.append(if (ai.isSuccess) "✓ 模型接口\n" else "✗ 模型：${ai.exceptionOrNull()?.message}\n")
                         sb.append(if (KeepAlive.ignoringBattery(ctx)) "✓ 电池白名单\n" else "✗ 电池白名单未开\n")
                         sb.append(if (KeepAlive.notificationsEnabled(ctx)) "✓ 通知权限\n" else "✗ 通知权限未开\n")
-                        sb.append(if (KeepAlive.hasAllFiles()) "✓ 文件权限\n" else "△ 文件权限未开（只影响发图）")
+                        sb.append(if (KeepAlive.hasAllFiles()) "✓ 文件权限\n" else "△ 文件权限未开（发本机文件会失败）")
                         checking = false
                         checkText = sb.toString()
                     }
@@ -172,6 +173,7 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
         QuickTile("🧠", "模型接口", "OpenAI 兼容格式", onClick = { onOpen("ai") })
         QuickTile("🗣️", "语音 TTS", "自配接口，发真语音", onClick = { onOpen("voice") })
         QuickTile("🖼️", "表情包", "自己加图，AI 会挑着发", onClick = { onOpen("stickers") })
+        QuickTile("📤", "文件发送", "图片、视频、语音、任意文件", onClick = { onOpen("files") })
 
         SectionTitle("系统")
         QuickTile(
@@ -301,6 +303,11 @@ fun SettingsScreen(onOpen: (String) -> Unit, onBack: () -> Unit) {
             ActionRow("语音 TTS", if (cfg.tts.enabled) "已开启" else "未开启") { onOpen("voice") }
             Line()
             ActionRow("表情包", "${cfg.stickers.size} 张") { onOpen("stickers") }
+            Line()
+            ActionRow(
+                "文件发送",
+                if (cfg.send.allowPlainFile) "上限 ${cfg.send.fileMaxMb}MB · 支持任意文件" else "只发图片 / 视频 / 语音"
+            ) { onOpen("files") }
         }
 
         SectionTitle("其他")

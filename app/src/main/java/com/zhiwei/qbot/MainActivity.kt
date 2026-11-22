@@ -21,6 +21,7 @@ import com.zhiwei.qbot.ui.AiScreen
 import com.zhiwei.qbot.ui.BgBottom
 import com.zhiwei.qbot.ui.BottomBar
 import com.zhiwei.qbot.ui.ConnectScreen
+import com.zhiwei.qbot.ui.FilesScreen
 import com.zhiwei.qbot.ui.GuideScreen
 import com.zhiwei.qbot.ui.HomeScreen
 import com.zhiwei.qbot.ui.LogsScreen
@@ -46,11 +47,17 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    /** 退到后台时把防抖中的配置落盘，避免进程被回收时丢最后几笔设置 */
+    override fun onStop() {
+        runCatching { Prefs.saveNow() }
+        super.onStop()
+    }
 }
 
 /** 二级页（带返回箭头，底栏隐藏） */
 private val SUB_PAGES = setOf(
-    "connect", "persona", "send", "ai", "voice", "stickers",
+    "connect", "persona", "send", "ai", "voice", "stickers", "files",
     "menus", "perms", "logs", "guide", "about"
 )
 
@@ -81,6 +88,7 @@ private fun AppRoot() {
                 "ai" -> AiScreen(onBack = { route = backTo })
                 "voice" -> VoiceScreen(onBack = { route = backTo })
                 "stickers" -> StickersScreen(onBack = { route = backTo })
+                "files" -> FilesScreen(onBack = { route = backTo })
                 "menus" -> MenusScreen(onBack = { route = backTo })
                 "perms" -> PermsScreen(onBack = { route = backTo })
                 "logs" -> LogsScreen(onBack = { route = backTo })

@@ -336,3 +336,46 @@ fun AiScreen(onBack: () -> Unit) {
         )
     }
 }
+
+/* ---------------- 文件发送 ---------------- */
+
+@Composable
+fun FilesScreen(onBack: () -> Unit) {
+    val cfg by Prefs.state.collectAsState()
+    val s = cfg.send
+
+    Page(title = "文件发送", subtitle = "图片、视频、语音，以及任何类型的文件", onBack = onBack) {
+        CardBox {
+            ToggleRow(
+                "允许发普通文件",
+                "pdf / zip / apk / docx 这类按 file_type=4 发；平台没开这项能力时会明确报错",
+                s.allowPlainFile
+            ) { v ->
+                Prefs.update { it.copy(send = it.send.copy(allowPlainFile = v)) }
+            }
+            Line()
+            ToggleRow("非管理员也能发", "关掉时只有管理员能用 /文件", s.fileForAll) { v ->
+                Prefs.update { it.copy(send = it.send.copy(fileForAll = v)) }
+            }
+            Line()
+            NumField("单文件上限 MB", s.fileMaxMb, { v ->
+                Prefs.update { it.copy(send = it.send.copy(fileMaxMb = v.coerceIn(1, 30))) }
+            }, hint = "默认 10；base64 上传，调太大容易内存紧张")
+        }
+
+        SectionTitle("怎么发")
+        CardBox {
+            Hint("本机文件：/文件 /sdcard/Download/报告.pdf")
+            Hint("公网文件：/文件 https://example.com/a.zip（平台自己去拉，适合大文件）")
+            Hint("让 AI 发：提示词里写 [文件:/sdcard/xxx.pdf]，路径必须真实存在。")
+            Hint("图片、视频、silk 语音会自动按对应类型发，不用改写法。")
+        }
+
+        SectionTitle("说明")
+        CardBox {
+            Hint("普通文件走官方 file_type=4，能不能发取决于开放平台给你的机器人开没开这项能力；被拒时日志里有平台的原始错误码。")
+            Hint("gif / webp 不重新编码，动画保留；其它图片会压到 1280px 再发。")
+            Hint("同一条消息的被动回复最多 5 次，文字段数加媒体一起算。")
+        }
+    }
+}

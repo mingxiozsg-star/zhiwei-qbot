@@ -120,8 +120,10 @@ fun GuideScreen(onBack: () -> Unit, onOpen: (String) -> Unit) {
             Hint("/状态 —— 看在线时长、收发计数、当前线路")
             Hint("/语音 你好呀 —— 让机器人说一句（仅管理员）")
             Hint("/表情 名字 —— 发指定表情")
-            Hint("/文件 /sdcard/xxx.jpg —— 只能发图片，普通文件官方未开放")
+            Hint("/文件 /sdcard/xxx.pdf —— 发本机文件，图片/视频/语音/任意文件都行")
+            Hint("/文件 https://…/a.zip —— 发公网文件，大文件走这条")
             Hint("/分句开、/分句关 —— 临时改发送方式")
+            Hint("/重连 —— 连接不对劲时手动重建（仅管理员）")
             Hint("/清除 —— 清掉这段对话的记忆")
         }
 

@@ -8,13 +8,17 @@ import com.zhiwei.qbot.core.flag
 import com.zhiwei.qbot.core.num
 import com.zhiwei.qbot.core.obj
 import com.zhiwei.qbot.core.str
-import org.json.JSONArray
 import org.json.JSONObject
 
 class QqApiException(val code: Int, val raw: String) : Exception("[$code] $raw")
 
 /**
- * QQ 开放平台 v2 接口。只管三件事：拿 token、发消息/上传媒体、回应按钮交互。
+ * QQ 开放平台 v2 接口。只管四件事：拿 token、发消息、上传媒体、回应按钮。
+ *
+ * 稳定性约定：
+ * 1. 401/403 或 11244 这类鉴权失败，自动刷新 AccessToken 再重试一次；
+ * 2. 网络层重试交给 Http，发送/上传各允许 2 次尝试（同 msg_seq，平台按 msg_seq 去重）；
+ * 3. 任何错误都把平台原始信息带出来，不吞。
  */
 object QqApi {
 
@@ -27,10 +31,10 @@ object QqApi {
     @Volatile private var tokenExpireAt: Long = 0L
     private val lock = Any()
 
-    private fun cfg(): Config = Prefs.current
-
     var lastTokenError: String = ""
         private set
+
+    private fun cfg(): Config = Prefs.current
 
     private fun base(): String {
         val c = cfg()
@@ -51,11 +55,11 @@ object QqApi {
             val payload = JSONObject().put("appId", c.appId).put("clientSecret", c.appSecret)
             val url = c.tokenUrl.ifBlank { "https://bots.qq.com/app/getAppAccessToken" }
             return try {
-                val text = Http.postJson(url, payload.toString(), timeoutSec = 20)
+                val text = Http.postJson(url, payload.toString(), timeoutSec = 20, retries = 3)
                 val json = JSONObject(text)
                 val tk = json.str("access_token")
                 if (tk.isBlank()) throw QqApiException(json.num("code", -1), text.take(200))
-                val expires = json.num("expires_in", 7200).toLong()
+                val expires = json.num("expires_in", 7200).toLong().coerceAtLeast(120)
                 token = tk
                 tokenExpireAt = System.currentTimeMillis() + (expires - 90).coerceAtLeast(60) * 1000
                 lastTokenError = ""
@@ -68,28 +72,51 @@ object QqApi {
         }
     }
 
-    private fun authHeaders(): Map<String, String> =
-        mapOf("Authorization" to "QQBot ${accessToken()}", "Content-Type" to "application/json")
+    private fun authHeaders(tk: String): Map<String, String> =
+        mapOf("Authorization" to "QQBot $tk", "Content-Type" to "application/json")
 
-    /** 网关地址，官方接口按 bot 下发，这里只是转发 */
-    fun gatewayUrl(): String {
-        val text = Http.get("${base()}/gateway", authHeaders(), timeoutSec = 20)
-        val url = JSONObject(text).str("url")
-        if (url.isBlank()) error("网关地址为空：${text.take(160)}")
-        return url
+    private fun isAuthFailure(e: Exception): Boolean = when (e) {
+        is HttpException -> e.status == 401 || e.status == 403
+        is QqApiException -> e.code in AUTH_CODES
+        else -> false
     }
 
-    private fun sendTo(path: String, msgId: String?, seq: Int, body: JSONObject): String {
-        if (msgId != null) {
-            body.put("msg_id", msgId)
-            body.put("msg_seq", seq)
-            if (!body.has("timestamp")) body.put("timestamp", System.currentTimeMillis() / 1000)
+    private val AUTH_CODES = setOf(11241, 11242, 11243, 11244, 11245, 40001)
+
+    /**
+     * 带 token 的调用：鉴权类错误自动刷新一次再重试，其余错误照常抛。
+     * token 传进 lambda，避免刷新后仍用旧值。
+     */
+    private fun <T> authed(block: (String) -> T): T {
+        return try {
+            block(accessToken())
+        } catch (e: Exception) {
+            if (!isAuthFailure(e)) throw e
+            Logs.w("鉴权失败（${e.message}），刷新 AccessToken 后重试")
+            block(accessToken(force = true))
         }
-        val text = Http.postJson("${base()}$path", body.toString(), authHeaders(), timeoutSec = 25)
-        val json = runCatching { JSONObject(text) }.getOrElse { return "" }
+    }
+
+    /** 网关地址，官方接口按 bot 下发，这里只是转发 */
+    fun gatewayUrl(): String = authed { tk ->
+        val text = Http.get("${base()}/gateway", authHeaders(tk), timeoutSec = 20, retries = 2)
+        val url = JSONObject(text).str("url")
+        if (url.isBlank()) error("网关地址为空：${text.take(160)}")
+        url
+    }
+
+    private fun sendTo(path: String, msgId: String?, seq: Int, body: JSONObject): String = authed { tk ->
+        val payload = JSONObject(body.toString())
+        if (msgId != null) {
+            payload.put("msg_id", msgId)
+            payload.put("msg_seq", seq)
+            if (!payload.has("timestamp")) payload.put("timestamp", System.currentTimeMillis() / 1000)
+        }
+        val text = Http.postJson("${base()}$path", payload.toString(), authHeaders(tk), timeoutSec = 30, retries = 2)
+        val json = runCatching { JSONObject(text) }.getOrElse { return@authed "" }
         val code = json.num("code", 0)
         if (code != 0) throw QqApiException(code, json.str("message", text.take(200)))
-        return json.str("id")
+        json.str("id")
     }
 
     fun sendGroup(groupOpenId: String, msgId: String?, seq: Int, body: JSONObject): String =
@@ -99,45 +126,73 @@ object QqApi {
         sendTo("/v2/users/$userOpenId/messages", msgId, seq, body)
 
     /**
-     * 上传富媒体。fileType：1 图片 / 2 视频 / 3 语音(silk) / 4 文件。
-     * srv_send_msg=false，只拿 file_info 再自己发送。
+     * 上传富媒体，返回 file_info。
+     * fileType：1 图片 / 2 视频 / 3 语音(silk) / 4 文件。
+     * 两种取件方式二选一：file_data(base64) 或 url(公网链接，适合大文件)。
+     * srv_send_msg=false：只拿 file_info，再由调用方自己发，这样能挂 msg_id 做被动回复。
      */
     fun uploadMedia(
         isGroup: Boolean,
         openId: String,
         fileType: Int,
-        bytes: ByteArray,
-        fileName: String
-    ): String {
+        bytes: ByteArray? = null,
+        fileName: String = "",
+        url: String = ""
+    ): String = authed { tk ->
         val path = if (isGroup) "/v2/groups/$openId/files" else "/v2/users/$openId/files"
         val payload = JSONObject()
             .put("file_type", fileType)
-            .put("file_data", Base64.encodeToString(bytes, Base64.NO_WRAP))
             .put("srv_send_msg", false)
+        if (url.isNotBlank()) {
+            payload.put("url", url)
+        } else {
+            payload.put("file_data", Base64.encodeToString(bytes ?: ByteArray(0), Base64.NO_WRAP))
+        }
         if (fileName.isNotBlank()) payload.put("file_name", fileName)
-        val text = Http.postJson("${base()}$path", payload.toString(), authHeaders(), timeoutSec = 60)
-        val json = JSONObject(text)
-        val info = json.str("file_info")
-        if (info.isBlank()) throw QqApiException(json.num("code", -1), text.take(200))
-        return info
+        val text = Http.postJson(
+            "${base()}$path",
+            payload.toString(),
+            authHeaders(tk),
+            timeoutSec = 120,
+            retries = 2
+        )
+        val json = runCatching { JSONObject(text) }
+            .getOrElse { error("上传返回不是 JSON：${text.take(160)}") }
+        val info = json.str("file_info").ifBlank { json.str("file_uuid") }
+        if (info.isBlank()) {
+            throw QqApiException(json.num("code", -1), json.str("message", text.take(200)))
+        }
+        info
     }
 
     /** 按钮点击必须回应，否则客户端一直转圈 */
     fun ackInteraction(interactionId: String, code: Int = 0) {
         runCatching {
             val body = JSONObject().put("code", code)
-            Http.putJson(
-                "${base()}/interactions/$interactionId",
-                body.toString(),
-                authHeaders(),
-                timeoutSec = 15
-            )
+            authed { tk ->
+                Http.putJson(
+                    "${base()}/interactions/$interactionId",
+                    body.toString(),
+                    authHeaders(tk),
+                    timeoutSec = 15,
+                    retries = 2
+                )
+            }
             Logs.i("已回应按钮交互 $interactionId")
         }.onFailure { Logs.w("回应交互失败：${it.message}") }
     }
 
     fun deleteMessage(groupOpenId: String, messageId: String) {
-        Http.request("${base()}/v2/groups/$groupOpenId/messages/$messageId", "DELETE", authHeaders())
+        runCatching {
+            authed { tk ->
+                Http.request(
+                    "${base()}/v2/groups/$groupOpenId/messages/$messageId",
+                    "DELETE",
+                    authHeaders(tk),
+                    timeoutSec = 20
+                )
+            }
+        }.onFailure { Logs.w("撤回消息失败：${it.message}") }
     }
 
     fun probeToken(): Result<String> = runCatching { accessToken(force = true) }
