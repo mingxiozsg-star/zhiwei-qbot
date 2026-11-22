@@ -18,6 +18,11 @@ class QqApiException(val code: Int, val raw: String) : Exception("[$code] $raw")
  */
 object QqApi {
 
+    /** 群聊/单聊消息事件 */
+    const val INTENT_GROUP_C2C = 1 shl 25
+    /** 按钮点击等交互事件：不订阅这个，菜单点了后台收不到 */
+    const val INTENT_INTERACTION = 1 shl 26
+
     @Volatile private var token: String = ""
     @Volatile private var tokenExpireAt: Long = 0L
     private val lock = Any()

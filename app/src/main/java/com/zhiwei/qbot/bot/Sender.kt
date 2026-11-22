@@ -66,7 +66,35 @@ object Sender {
 
     fun sendMenu(conv: Conversation, menu: MenuDef): Boolean {
         val text = menu.text.ifBlank { menu.title }
-        return sendText(conv, text, menu)
+        // 官方要求：按钮挂在 markdown 消息上（msg_type=2），text 消息带 keyboard 不生效
+        val md = "**${menu.title}**\n$text"
+        val body = JSONObject()
+            .put("content", md)
+            .put("msg_type", 2)
+            .put("markdown", JSONObject().put("content", md))
+            .put("keyboard", Keyboard.build(menu))
+        var ok = send(conv, body).isSuccess
+        if (!ok) {
+            Logs.w("按钮消息被拒，退回普通文字 + 键盘")
+            ok = sendText(conv, text, menu)
+        }
+        if (!ok) {
+            Logs.w("键盘不可用，退回纯文字菜单")
+            ok = sendText(conv, menuPlainText(menu))
+        }
+        if (ok) Logs.i("→ 菜单：${menu.title}")
+        return ok
+    }
+
+    /** 没有按钮权限时的兜底文案：把按钮摊平成指令 */
+    fun menuPlainText(menu: MenuDef): String {
+        val sb = StringBuilder(menu.title).append("：\n")
+        menu.buttons.forEach { b ->
+            sb.append("· ").append(b.label)
+            if (b.command.isNotBlank()) sb.append(" → ").append(b.command)
+            sb.append('\n')
+        }
+        return sb.toString().trim()
     }
 
     fun sendSticker(conv: Conversation, sticker: Sticker): Boolean = runCatching {
@@ -108,18 +136,25 @@ object Sender {
         false
     }
 
-    /** 普通文件走 file_type=4；平台对普通文件开放程度有限，失败会在日志里给原话。 */
+    /**
+     * 平台现状：file_type=4（普通文件）官方尚未开放，只有图片/视频/语音能用。
+     * 所以这里只发图片，其它类型如实说明，不假装发出去。
+     */
     fun sendFile(conv: Conversation, path: String): Boolean = runCatching {
-        val bytes = Store.readBytes(path.trim(), limitMb = 12)
-        val name = path.substringAfterLast('/')
-        val info = QqApi.uploadMedia(conv.isGroup, conv.openId, 4, bytes, name)
-        val body = JSONObject().put("msg_type", 7).put("media", JSONObject().put("file_info", info))
-        send(conv, body).getOrThrow()
-        Logs.i("→ 文件 $name")
-        true
+        val clean = path.trim()
+        val name = clean.substringAfterLast('/')
+        val image = name.substringAfterLast('.', "").lowercase() in
+            setOf("png", "jpg", "jpeg", "gif", "webp", "bmp")
+        if (!image) {
+            Logs.w("官方未开放普通文件发送：$name")
+            sendText(conv, "官方接口还没开放普通文件，只能发图片、语音和视频。")
+            return@runCatching false
+        }
+        val bytes = Store.readBytes(clean, limitMb = 12)
+        sendImageBytes(conv, bytes, name)
     }.getOrElse {
         Runtime.fail()
-        Logs.e("发文件失败：${it.message}")
+        Logs.e("发送失败：${it.message}")
         false
     }
 }

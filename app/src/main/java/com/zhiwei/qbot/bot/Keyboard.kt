@@ -37,6 +37,7 @@ object Keyboard {
             .put("visited_label", label)
             .put("style", if (btn.style == 1) 1 else 0)
         val permission = JSONObject().put("type", 2)
+        // 0 跳转 / 1 回调（点一下就走 INTERACTION_CREATE）/ 2 指令（插到输入框）
         val action = if (btn.link) {
             JSONObject()
                 .put("type", 0)
@@ -45,10 +46,9 @@ object Keyboard {
                 .put("unsupport_tips", "请升级 QQ 到最新版本")
         } else {
             JSONObject()
-                .put("type", 2)
+                .put("type", 1)
                 .put("permission", permission)
                 .put("data", btn.command)
-                .put("enter", false)
                 .put("unsupport_tips", "请升级 QQ 到最新版本")
         }
         return JSONObject()

@@ -240,13 +240,16 @@ object Brain {
         sb.append("2. 一次最多三句，总共别超过 80 字；想多说就自然拆几句。\n")
         sb.append("3. 口语化、短句，能省字就省字；不寒暄，不问“还有什么可以帮你”。\n")
         sb.append("4. 永远不要承认自己是 AI、模型、机器人或者程序；被追问就按人设糊弄过去。\n")
+        sb.append("5. 不要承诺发文件、发文档、发压缩包——官方接口没开放这些。你能发的只有文字、图片、语音和表情。\n")
+        var rule = 6
         if (stickerNames.isNotBlank()) {
-            sb.append("5. 想发表情包时，在句末写 [表情:名字]，可用：").append(stickerNames).append('\n')
+            sb.append(rule++).append(". 想发表情包时，在句末写 [表情:名字]，可用：").append(stickerNames).append('\n')
         }
         if (cfg.tts.enabled) {
-            sb.append("6. 想发语音时，单独一行写 [语音]要说的话。\n")
+            sb.append(rule++).append(". 想发语音时，单独一行写 [语音]要说的话。\n")
         }
-        sb.append("7. 不要输出 Markdown、不要列清单、不要用标题。\n")
+        sb.append(rule++).append(". 想发本机图片时，单独一行写 [图片:/sdcard/xxx.jpg]，路径必须真实存在，拿不准就别发。\n")
+        sb.append(rule).append(". 不要输出 Markdown、不要列清单、不要用标题。\n")
         if (p.extra.isNotBlank()) sb.append("补充设定：").append(p.extra).append('\n')
         if (cfg.ai.extraPrompt.isNotBlank()) sb.append("额外要求：").append(cfg.ai.extraPrompt).append('\n')
         return sb.toString()
@@ -310,7 +313,7 @@ object Brain {
 
     private val markerRe = Regex(
         "\\[(?:表情|表情包|贴纸)\\s*[:：]\\s*([^\\]]+)]" +
-            "|\\[文件\\s*[:：]\\s*([^\\]]+)]" +
+            "|\\[(?:文件|图片)\\s*[:：]\\s*([^\\]]+)]" +
             "|\\[语音\\]\\s*([^\\n\\[]*)"
     )
 

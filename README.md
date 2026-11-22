@@ -45,7 +45,7 @@
 
 **构建**：`./gradlew assembleDebug` / `assembleRelease`。签名走环境变量 `KEYSTORE_FILE`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`，没有 keystore 时回退 debug 签名。推 `v*` 标签由 GitHub Actions 构建并发布。JDK 17 / compileSdk 35 / minSdk 24。
 
-**边界**：同一条消息被动回复最多 5 次，分句段数加媒体别超；群聊要 @ 机器人；不是外挂，不做账号登录，不绕过平台限制；模型说的话由模型负责，先自己测几句。
+**边界**：同一条消息被动回复最多 5 次，分句段数加媒体别超；群聊要 @ 机器人；按钮消息必须走 markdown，且自定义按钮是开放平台「内邀」能力、模板按钮需申请，没开通时本工具自动退回纯文字菜单；`file_type=4` 普通文件官方尚未开放，只能发图片/语音/视频；不是外挂，不做账号登录，不绕过平台限制；模型说的话由模型负责，先自己测几句。
 
 **许可**：MIT。QQ 接口的使用需遵守《QQ 开放平台开发者服务协议》。
 

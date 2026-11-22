@@ -43,6 +43,8 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
     @Volatile private var attempt: Int = 0
     @Volatile private var stopping = false
     @Volatile private var lastReconnectAt: Long = 0L
+    @Volatile private var sessionId: String = ""
+    @Volatile private var resumeUrl: String = ""
 
     fun isRunning(): Boolean = running
 
@@ -81,11 +83,15 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
                     if (attempt == 0) "正在获取网关…" else "第 $attempt 次重连…"
                 )
                 val cfg = Prefs.current
-                val primary = QqApi.gatewayUrl()
-                val useBackup = attempt >= 2 && cfg.backupGateway.isNotBlank()
-                val url = if (useBackup) cfg.backupGateway.trim() else primary
+                val canResume = sessionId.isNotBlank() && lastSeq > 0 && resumeUrl.isNotBlank()
+                val useBackup = !canResume && attempt >= 2 && cfg.backupGateway.isNotBlank()
+                val url = when {
+                    canResume -> resumeUrl
+                    useBackup -> cfg.backupGateway.trim()
+                    else -> QqApi.gatewayUrl()
+                }
                 if (url != currentUrl) {
-                    Logs.i("线路[${if (useBackup) "备用" else "主"}] $url")
+                    Logs.i("线路[${if (canResume) "续连" else if (useBackup) "备用" else "主"}] $url")
                     currentUrl = url
                 }
                 val req = Request.Builder().url(url).build()
@@ -100,16 +106,30 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
     private val listener = object : WebSocketListener() {
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            Logs.i("WebSocket 已建立，发送鉴权")
             try {
                 val token = QqApi.accessToken()
+                if (sessionId.isNotBlank() && lastSeq > 0) {
+                    val resume = JSONObject()
+                        .put("op", 6)
+                        .put(
+                            "d",
+                            JSONObject()
+                                .put("token", "QQBot $token")
+                                .put("session_id", sessionId)
+                                .put("seq", lastSeq)
+                        )
+                    Logs.i("WebSocket 已建立，尝试续连 seq=$lastSeq")
+                    if (!webSocket.send(resume.toString())) reconnect("续连包发送失败")
+                    return
+                }
+                Logs.i("WebSocket 已建立，发送鉴权")
                 val props = JSONObject()
                     .put("\$os", "Android")
                     .put("\$browser", "ZhiweiQBot")
                     .put("\$device", "android")
                 val d = JSONObject()
                     .put("token", "QQBot $token")
-                    .put("intents", 1 shl 25)
+                    .put("intents", QqApi.INTENT_GROUP_C2C or QqApi.INTENT_INTERACTION)
                     .put("shard", JSONArray().put(0).put(1))
                     .put("properties", props)
                 val identify = JSONObject().put("op", 2).put("d", d)
@@ -139,10 +159,16 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
                         val data = json.obj("d")
                         if (type == "READY") {
                             attempt = 0
+                            sessionId = data.str("session_id")
+                            resumeUrl = data.str("resume_gateway_url")
                             val name = data.obj("user").str("username", Prefs.current.persona.name)
                             Runtime.botName(name)
                             Runtime.connected(currentUrl)
                             Logs.i("机器人已上线：$name")
+                        } else if (type == "RESUMED") {
+                            attempt = 0
+                            Runtime.connected(currentUrl)
+                            Logs.i("已续连，事件不丢")
                         } else if (type.isNotBlank()) {
                             Runtime.received()
                             try {
@@ -155,6 +181,9 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
                     7 -> reconnect("服务端要求重连")
                     9 -> {
                         Logs.w("会话失效，刷新 token 后重连")
+                        sessionId = ""
+                        resumeUrl = ""
+                        lastSeq = 0
                         runCatching { QqApi.accessToken(force = true) }
                         reconnect("会话失效")
                     }
@@ -188,7 +217,7 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
                 delay(interval)
                 if (!running) break
                 val gap = System.currentTimeMillis() - lastAck
-                if (gap > interval * 2 + 10_000) {
+                if (gap > interval * 2 + 15_000) {
                     reconnect("心跳超时（${gap / 1000}s 无响应）")
                     break
                 }
