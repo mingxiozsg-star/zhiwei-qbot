@@ -118,7 +118,7 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
                         BotService.start(ctx)
                     }
                 }
-                Ghost("测试对话", onTalk)
+                Ghost("测试对话", onClick = onTalk)
             }
             if (running) {
                 Hint("后台常驻已开启。把应用加入电池白名单会更稳。")

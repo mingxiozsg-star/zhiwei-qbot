@@ -122,9 +122,9 @@ object KeepAlive {
 
     fun openAutostart(activity: Activity) {
         val pm = activity.packageManager
-        for (component in autostartPages) {
+        for (comp in autostartPages) {
             val intent = Intent().apply {
-                component = component
+                component = comp
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             if (pm.resolveActivity(intent, 0) != null) {
