@@ -20,9 +20,11 @@
 - 发整个目录：模型输出 `[目录:/sdcard/Download/资料]`，或管理员 `/文件 /sdcard/Download/资料`，目录里的文件逐个发，并汇报成功与失败数量。
 - 状态查询：`/状态` 给出确切信息——运行平台、机型、系统、电量、内存、存储、运行时长、线路、收发计数与记忆统计。
 - 保活引导：通知、电池白名单、自启动、后台弹出、访问所有文件，逐项检测 + 一键跳转。
-- 双进程保活：主服务之外的 `:guard` 独立进程，每 20 秒确认主服务还在不在，被系统回收就拉回来；主服务自己的看门狗跟着一起死，所以必须有第二个进程。
+- 抗 Doze 三重保险：CPU 锁只防 CPU 睡、防不住息屏掐 WiFi，所以同时持有 `WIFI_MODE_FULL_HIGH_PERF` 的 WiFi 锁；进程被冻结时协程 `delay` 会一起冻结，改用 `AlarmManager.setAndAllowWhileIdle` 每 15 分钟穿透 Doze 唤醒自检；网络恢复时通过 `ConnectivityManager` 回调立刻重连，不再干等 30 秒退避；在最近任务划掉卡片会在 `onTaskRemoved` 里自动复活。
+- 双进程保活：主服务之外的 `:guard` 独立进程，读主服务写的心跳文件 `bot.alive` 判断主服务还在不在（不用 `getRunningServices`，它在 Android 8+ 只返回自己进程的服务，跨进程恒判死亡会造成无限重启），真死了才拉起。
 - 快捷指令自定义：触发词、说明、动作、参数全部可在应用内增删改查与启停，出厂带 `q`/`w`/`e`/`s`/`目录`/`备份`/`状态`；指令表同时拼进系统提示词，模型知道有哪些指令、能干什么，你说「用 q 列一下目录」它不会再当普通聊天。
-- 模型按用途分配：普通对话、复杂推理（师徒模型）、语音稿、画图四栏可各填 BaseURL / Key / 模型名，留空自动回落到主模型——「普通模型能顶替就不用填」。长句或多步请求自动切到推理栏，每栏都能单独测通。
+- 模型按用途分配：普通对话、识图、语音稿、画图四栏可各填 BaseURL / Key / 模型名，留空自动回落到主模型——「普通模型能顶替就不用填」。别人发来图片时自动切到识图栏，把图以 `image_url` 混排进请求；四栏都能单独测通，画图栏点自测会真画一张出来验证。
+- 画图与语音稿：模型写 `[画图:描述]` 或发 `/画图 描述` 即现画一张发出来；`[语音]文本` 会先经语音栏模型改写成纯口语稿（去掉 Markdown 与表情符号），再交 TTS 合成 silk，念出来不再带 `**` 和 `~`。
 - 备份与恢复：配置、记忆库、全部对话、表情原图打成一个 zip 存到 `/sdcard/ZhiweiQBot`，换机或重装时一键覆盖还原，也可从任意路径导入。
 - 看目录不再发文件：说「看/列一下某目录」只回紧凑文件清单（名字、大小、时间），不再把文件本身推给你；「内部存储」「下载」这类口语路径直接映射到真实目录。
 
@@ -107,9 +109,10 @@ Bring your own model to QQ's official bot API. Your persona — with real emotio
 - Whole directories: `[dir:/sdcard/Download/stuff]` from the model, or `/file /sdcard/Download/stuff` for admins — files go out one by one with a summary of what succeeded.
 - Status: `/status` reports exact info — platform, model, OS, battery, memory, storage, uptime, route, counters and memory stats.
 - Keep‑alive help: notifications, battery whitelist, autostart, background pop‑up, all‑files access — status check plus a jump to the right settings page.
-- Two‑process keep‑alive: an independent `:guard` process checks every 20s whether the main service is still alive and revives it after a kill. The main service's own watchdog dies with it, so a second process is the only thing that can bring it back.
+- Two‑process keep‑alive: an independent `:guard` process reads a `bot.alive` heartbeat file written by the main service instead of calling `getRunningServices` (which on Android 8+ only reports the caller's own process — cross‑process it always looks dead and would restart the bot in an endless loop), and only revives it when it is really gone. The main service's own watchdog dies with it, so a second process is the only thing that can bring it back.
 - Custom shortcuts: trigger word, description, action and argument are all editable in‑app, with enable/disable. Ships with `q`/`w`/`e`/`s`/`目录`/`备份`/`状态`; the same table is injected into the system prompt, so the model knows the shortcuts exist and won't treat "run q for me" as small talk.
-- Per‑purpose models: plain chat, complex reasoning (a stronger "mentor" model), voice script, and image generation each take their own BaseURL / key / model. Leave a slot empty and it falls back to the main model — fill only what you actually need. Long or multi‑step requests are routed to the reasoning slot automatically, and each slot has its own connectivity test.
+- Per‑purpose models: plain chat, vision, voice script, and image generation each take their own BaseURL / key / model. Leave a slot empty and it falls back to the main model — fill only what you actually need. When someone sends a picture, the request switches to the vision slot and the image is mixed into the payload as an `image_url` part; every slot has its own connectivity test, and the image slot actually draws one picture to prove it works.
+- Drawing and speech: `[draw:description]` in a reply, or `/draw description`, generates and sends a picture on the spot; `[voice]text` is first rewritten into plain spoken language by the voice‑script model (Markdown and emoji stripped) before TTS turns it into silk, so it no longer reads out asterisks and tildes.
 - Backup & restore: config, memory, full conversation history and original sticker files packed into one zip under `/sdcard/ZhiweiQBot`; restore with one tap on a new device, or import from any path.
 - Listing is not sending: asking to "look at / list a folder" returns a compact listing (name, size, time) instead of pushing the files themselves; colloquial paths like "internal storage" or "downloads" map to the real directories.
 
@@ -166,6 +169,7 @@ Admins go in “Connection → admin openid”, comma separated; empty means eve
 - API calls: 401/403 and auth error codes trigger a token refresh and one retry; network errors and 5xx are retried with backoff; sends keep a minimum gap to avoid rate limits.
 - Handling: one conversation at a time, at most 4 model calls at once; a failed model call is retried 3 times before a short apology.
 - Safety nets: the foreground service re‑arms the gateway every 45s, the notification has “Reconnect” and “Stop”, crashes persist config and log the reason first, config is debounced 500ms and flushed on background, logs capped at 300 lines.
+- Surviving Doze: a CPU wake lock alone keeps the CPU awake but not the Wi‑Fi, so a `WIFI_MODE_FULL_HIGH_PERF` Wi‑Fi lock is held alongside it; coroutine `delay` freezes with the process, so `AlarmManager.setAndAllowWhileIdle` wakes it every 15 minutes to self‑check; a `ConnectivityManager` callback reconnects the instant the network returns instead of waiting out the 30s backoff; `onTaskRemoved` revives the service when the card is swiped away. The `:guard` process reads a `bot.alive` heartbeat file instead of `getRunningServices`, which on Android 8+ only reports the caller's own process and would otherwise restart the bot in an endless loop.
 
 **Build**: `./gradlew assembleDebug` or `assembleRelease`. Signing reads `KEYSTORE_FILE`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`; **the build fails outright when no release keystore is present** — a differently signed package can't be installed over the old one, forcing users to uninstall and lose data, so falling back to the debug key is never allowed. The package name is fixed at `com.zhiwei.qbot`. Pushing a `v*` tag builds and publishes via GitHub Actions. JDK 17 / compileSdk 35 / minSdk 24.
 

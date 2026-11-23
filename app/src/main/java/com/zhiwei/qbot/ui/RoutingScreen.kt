@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.sp
 import com.zhiwei.qbot.core.ModelSlot
 import com.zhiwei.qbot.core.Prefs
 import com.zhiwei.qbot.net.AiApi
+import com.zhiwei.qbot.net.ImageApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -27,7 +28,7 @@ import kotlinx.coroutines.withContext
 /**
  * 模型按用途分配。
  *
- * 需求原话是「普通对话 / 师徒模型 / 语音 / 画图，各自能填 API 地址；
+ * 需求原话是「普通对话 / 识图 / 语音 / 画图，各自能填 API 地址；
  * 普通模型能顶替的就不用填」。所以这里每一栏都允许留空，
  * 留空即回落到全局那一组，填了才覆盖。
  */
@@ -59,13 +60,13 @@ fun RoutingScreen(onBack: () -> Unit) {
         )
 
         slotSection(
-            title = "复杂推理（师徒模型）",
-            desc = "多步任务、长指令、需要先查再发的那种。空着同样用主模型。",
-            slot = r.subagent,
-            testingKey = "subagent",
+            title = "识图模型",
+            desc = "别人发图片时用它看图。空着就用主模型——主模型不支持看图的话会看不出内容。",
+            slot = r.vision,
+            testingKey = "vision",
             testing = testing,
-            onChange = { s -> Prefs.update { it.copy(routing = it.routing.copy(subagent = s)) } },
-            onTest = { s -> testing = "subagent"; testSlot(scope, s, cfg.ai) { pair -> testing = ""; result = pair } }
+            onChange = { s -> Prefs.update { it.copy(routing = it.routing.copy(vision = s)) } },
+            onTest = { s -> testing = "vision"; testSlot(scope, s, cfg.ai) { pair -> testing = ""; result = pair } }
         )
 
         slotSection(
@@ -85,7 +86,7 @@ fun RoutingScreen(onBack: () -> Unit) {
             testingKey = "image",
             testing = testing,
             onChange = { s -> Prefs.update { it.copy(routing = it.routing.copy(image = s)) } },
-            onTest = { s -> testing = "image"; testSlot(scope, s, cfg.ai) { pair -> testing = ""; result = pair } }
+            onTest = { s -> testing = "image"; testImageSlot(scope, s, cfg.ai) { pair -> testing = ""; result = pair } }
         )
 
         SectionTitle("说明")
@@ -93,6 +94,7 @@ fun RoutingScreen(onBack: () -> Unit) {
             Hint("· 规则很简单：这一栏的地址和模型名都填了才生效，否则整栏回落到主模型。")
             Hint("· Key 留空时会用主模型的 Key，适合同一个中转站里换模型名。")
             Hint("· 温度、tokens 每栏可单独调，语音/画图一般给低一点。")
+            Hint("· 语音/画图两栏不生效时，画图与语音稿会退回主模型，功能不会因此消失。")
         }
     }
 
@@ -133,6 +135,35 @@ private fun testSlot(
         done(
             if (r.isSuccess) (r.getOrNull() ?: "") to "这栏能用"
             else (r.exceptionOrNull()?.message ?: "失败") to "这栏调不通"
+        )
+    }
+}
+
+/** 画图栏走的是另一个端点，用文字测试测不出真假，得真画一张 */
+private fun testImageSlot(
+    scope: kotlinx.coroutines.CoroutineScope,
+    slot: ModelSlot,
+    fallback: com.zhiwei.qbot.core.AiConfig,
+    done: (Pair<String, String>) -> Unit
+) {
+    scope.launch {
+        val r = withContext(Dispatchers.IO) {
+            runCatching {
+                val effective = if (slot.filled) {
+                    com.zhiwei.qbot.core.ModelRouting().effective(slot, fallback)
+                } else {
+                    fallback
+                }
+                ImageApi.generate("a single red dot on white background", effective)
+            }
+        }
+        done(
+            if (r.isSuccess) {
+                val img = r.getOrNull()
+                "画出来了：${img?.ext?.uppercase()} ${(img?.bytes?.size ?: 0) / 1024}KB" to "这栏能画图"
+            } else {
+                (r.exceptionOrNull()?.message ?: "失败") to "这栏画不出来"
+            }
         )
     }
 }

@@ -9,7 +9,7 @@ import org.json.JSONObject
  */
 object AiApi {
 
-    data class Msg(val role: String, val content: String)
+    data class Msg(val role: String, val content: String, val images: List<String> = emptyList())
 
     private fun endpoint(baseUrl: String): String {
         val base = baseUrl.trim().trimEnd('/')
@@ -27,7 +27,27 @@ object AiApi {
         require(cfg.baseUrl.isNotBlank()) { "还没填模型接口地址" }
         require(cfg.model.isNotBlank()) { "还没填模型名" }
         val arr = JSONArray()
-        messages.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
+        messages.forEach { m ->
+            val node = JSONObject().put("role", m.role)
+            if (m.images.isEmpty()) {
+                node.put("content", m.content)
+            } else {
+                // 多模态：OpenAI 兼容格式，文字 + image_url 混排。识图模型靠这个看图片
+                val parts = JSONArray()
+                if (m.content.isNotBlank()) {
+                    parts.put(JSONObject().put("type", "text").put("text", m.content))
+                }
+                m.images.forEach { url ->
+                    parts.put(
+                        JSONObject()
+                            .put("type", "image_url")
+                            .put("image_url", JSONObject().put("url", url))
+                    )
+                }
+                node.put("content", parts)
+            }
+            arr.put(node)
+        }
         val body = JSONObject()
             .put("model", cfg.model.trim())
             .put("messages", arr)

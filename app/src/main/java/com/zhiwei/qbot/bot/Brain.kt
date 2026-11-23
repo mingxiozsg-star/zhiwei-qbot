@@ -9,6 +9,7 @@ import com.zhiwei.qbot.core.Shortcut
 import com.zhiwei.qbot.core.Shortcuts
 import com.zhiwei.qbot.core.Sticker
 import com.zhiwei.qbot.net.AiApi
+import com.zhiwei.qbot.net.ImageApi
 import com.zhiwei.qbot.net.QqApi
 import com.zhiwei.qbot.net.TtsApi
 import com.zhiwei.qbot.util.DeviceInfo
@@ -68,7 +69,8 @@ object Brain {
                     author?.optString("union_openid") ?: "",
                     author?.optString("member_openid") ?: "",
                     author?.optString("member_name") ?: "群友",
-                    "群·" + groupId.takeLast(4)
+                    "群·" + groupId.takeLast(4),
+                    imageUrls(d)
                 )
             }
             "C2C_MESSAGE_CREATE" -> {
@@ -81,7 +83,8 @@ object Brain {
                     author?.optString("union_openid") ?: "",
                     userOpenId,
                     author?.optString("username") ?: "对方",
-                    "私聊"
+                    "私聊",
+                    imageUrls(d)
                 )
             }
             "AT_MESSAGE_CREATE" -> Logs.i("频道消息暂不处理（本工具只接群聊与单聊）")
@@ -94,6 +97,33 @@ object Brain {
     }
 
     /* ---------------- 入站 ---------------- */
+
+    /**
+     * 从事件里捞出图片链接。
+     *
+     * QQ 的附件在 `attachments` 里，`content_type` 形如 image/jpeg；
+     * `url` 有时是协议相对地址（//multimedia.nt.qq.com.cn/...），必须补 https。
+     * 只取前 4 张：识图模型对多图有额外计费与长度限制，超过也没意义。
+     */
+    private fun imageUrls(d: JSONObject): List<String> {
+        val arr = d.optJSONArray("attachments") ?: return emptyList()
+        val out = ArrayList<String>()
+        for (i in 0 until arr.length()) {
+            val a = arr.optJSONObject(i) ?: continue
+            val type = a.optString("content_type").lowercase()
+            val name = a.optString("filename").lowercase()
+            val isImage = type.startsWith("image/") ||
+                name.endsWith(".jpg") || name.endsWith(".jpeg") ||
+                name.endsWith(".png") || name.endsWith(".webp") || name.endsWith(".gif")
+            if (!isImage) continue
+            val url = a.optString("url").trim()
+            if (url.isBlank()) continue
+            out.add(if (url.startsWith("//")) "https:$url" else url)
+            if (out.size >= 4) break
+        }
+        if (out.isNotEmpty()) Logs.i("收到 ${out.size} 张图片，走识图")
+        return out
+    }
 
     private fun clean(raw: String): String =
         raw.replace(Regex("<@!?[A-Za-z0-9]+>"), "")
@@ -130,23 +160,27 @@ object Brain {
         unionId: String,
         openId: String,
         senderName: String,
-        scene: String
+        scene: String,
+        images: List<String> = emptyList()
     ) {
         if (conv.openId.isBlank()) return
         val text = clean(raw)
-        if (text.isBlank()) return
+        // 只发图不打字也正常：有图就不能当成空消息丢掉
+        if (text.isBlank() && images.isEmpty()) return
         Logs.i("[${if (conv.isGroup) "群" else "私聊"}] ${senderName.ifBlank { "某人" }}：${text.take(60)}")
-        val memKey = rememberPerson(unionId, openId, senderName, text, scene)
+        val memText = if (images.isEmpty()) text else (text.ifBlank { "（发了 ${images.size} 张图）" } + " [图片×${images.size}]")
+        val memKey = rememberPerson(unionId, openId, senderName, memText, scene)
         // 权限判定仍用平台原始 id（管理员列表里填的是 openid / union_openid）
         val ownerId = openId.ifBlank { unionId }
         scope.launch {
             lockFor(convKey(conv)).withLock {
                 try {
-                    if (routeCommand(text, conv, ownerId, senderName, memKey = memKey)) return@withLock
+                    // 带图就别当指令解析了，直接交给识图模型看
+                    if (images.isEmpty() && routeCommand(text, conv, ownerId, senderName, memKey = memKey)) return@withLock
                     val cfg = Prefs.current
                     if (conv.isGroup && !cfg.aiGroup) return@withLock
                     if (!conv.isGroup && !cfg.aiC2c) return@withLock
-                    replyWithAi(conv, text, memKey, senderName, ownerId)
+                    replyWithAi(conv, text, memKey, senderName, ownerId, images)
                 } catch (e: Exception) {
                     Logs.e("处理消息出错：${e.message}")
                 }
@@ -370,6 +404,19 @@ object Brain {
                 scope.launch { speak(conv, say, report = true) }
                 return true
             }
+            lower.startsWith("/画图") || lower.startsWith("/画") -> {
+                val prompt = text.substringAfter(' ').trim()
+                if (prompt.isBlank()) {
+                    Sender.sendText(conv, "写法：/画图 一只在雨里打伞的橘猫，赛博朋克风格")
+                    return true
+                }
+                val holder = conv
+                scope.launch {
+                    Sender.sendText(holder, "画一张，等我一下。")
+                    drawImage(holder, prompt, Prefs.current)
+                }
+                return true
+            }
             lower.startsWith("/表情") || lower.startsWith("/贴纸") -> {
                 val name = text.substringAfter(' ').trim()
                 if (name.isBlank()) {
@@ -403,12 +450,15 @@ object Brain {
             }
             lower == "/帮助" || lower == "/指令" -> {
                 val main = cfg.menus.firstOrNull { it.id == "main" }
-                if (main != null) Sender.sendMenu(conv, main)
-                else Sender.sendText(
-                    conv,
-                    "指令：/状态 /记忆 /记住 内容 /忘记 /文件 路径或目录 /语音 文本 /表情 名字 /分句开 /分句关 /清除 /重连\n" +
-                        "快捷：q 看文件 · w 找安装包 · e 发安装包 · s 发压缩包"
-                )
+                if (main != null) {
+                    Sender.sendMenu(conv, main)
+                } else {
+                    Sender.sendText(
+                        conv,
+                        "指令：/状态 /记忆 /记住 内容 /忘记 /文件 路径或目录 /语音 文本 /画图 描述 /表情 名字 /分句开 /分句关 /清除 /重连\n" +
+                            "快捷：q 看文件 · w 找安装包 · e 发安装包 · s 发压缩包"
+                    )
+                }
                 return true
             }
         }
@@ -676,6 +726,8 @@ object Brain {
             sb.append(rule++).append(". 想发语音时，单独一行写 [语音]要说的话。\n")
         }
         sb.append(rule++).append(". 想发本机图片时，单独一行写 [图片:/sdcard/xxx.jpg]。\n")
+        sb.append(rule++).append(". 对方让你画图/要一张不存在的图时，单独一行写 [画图:画面描述]，描述写具体点（主体、风格、颜色、构图）。")
+            .append("硬要先确认能不能画的时候先说一句，别装已经画好。\n")
         sb.append(rule++).append(". 想发本机文件时，单独一行写 [文件:/sdcard/xxx.pdf]，一次最多一个。\n")
         sb.append(rule++).append(". 想把整个文件夹里的文件全发给对方，才写 [目录:/sdcard/Download/某个文件夹]，一次最多一个。\n")
         sb.append(rule++).append(". 对方只是想「看看/列出/有什么文件」时，绝对不要用 [目录:] 或 [文件:]——")
@@ -703,21 +755,13 @@ object Brain {
     /**
      * 按用途挑模型。
      *
-     * 复杂请求（多步、带「然后/再/顺便」、同时提到查和发）走 subagent 槽位，
-     * 其余走 chat 槽位；某个槽位没填时 [ModelRouting.effective] 自动回落到全局模型。
+     * 只区分「有没有图片要识图」：带图走 [ModelRouting.vision]，其余走 [ModelRouting.chat]。
+     * 槽位没填时 [ModelRouting.effective] 自动回落到全局模型，所以不配也能跑。
      */
-    private fun modelFor(cfg: Config, text: String, complex: Boolean = false): com.zhiwei.qbot.core.AiConfig {
+    private fun modelFor(cfg: Config, hasImages: Boolean): com.zhiwei.qbot.core.AiConfig {
         if (!cfg.routing.enabled) return cfg.ai
-        val slot = if (complex || looksComplex(text)) cfg.routing.subagent else cfg.routing.chat
+        val slot = if (hasImages) cfg.routing.vision else cfg.routing.chat
         return runCatching { cfg.routing.effective(slot, cfg.ai) }.getOrDefault(cfg.ai)
-    }
-
-    private val complexHints = listOf("然后", "接着", "再帮我", "顺便", "并且", "之后", "先", "再发", "再列", "全部", "所有")
-
-    private fun looksComplex(text: String): Boolean {
-        if (text.length > 80) return true
-        val hits = complexHints.count { text.contains(it, true) }
-        return hits >= 2
     }
 
     /** 当前说话人的资料 + 提炼记忆 + 相关原始对话，直接拼进系统提示词 */
@@ -761,15 +805,23 @@ object Brain {
         text: String,
         senderId: String,
         senderName: String,
-        isGroup: Boolean
+        isGroup: Boolean,
+        images: List<String> = emptyList()
     ): List<AiApi.Msg> {
         val list = ArrayList<AiApi.Msg>()
-        val system = buildSystemPrompt(cfg, isGroup) + memoryBlock(cfg, senderId, senderName, text)
+        var system = buildSystemPrompt(cfg, isGroup) + memoryBlock(cfg, senderId, senderName, text)
+        if (images.isNotEmpty()) {
+            system += "\n【这次带了图】对方发来 ${images.size} 张图片，图片就在这条消息里。" +
+                "你要真的看图说话：说出你看到了什么，不要泛泛地说“图片很好看”。" +
+                "图看不清或看不懂就直说，别编内容。"
+        }
         list.add(AiApi.Msg("system", system))
         synchronized(historyLock) {
             histories[key]?.takeLast(cfg.ai.history.coerceIn(0, 40))?.let { list.addAll(it) }
         }
-        list.add(AiApi.Msg("user", if (isGroup) "${senderName.ifBlank { "群友" }}：$text" else text))
+        val body = if (isGroup) "${senderName.ifBlank { "群友" }}：${text.ifBlank { "（发了图片）" }}" else text.ifBlank { "（发了图片）" }
+        // images 只挂在最后这条上：历史里的图片地址是会过期的，留着只会让下次请求 404
+        list.add(AiApi.Msg("user", body, images))
         return list
     }
 
@@ -792,13 +844,14 @@ object Brain {
         text: String,
         memKey: String,
         senderName: String,
-        ownerId: String = memKey
+        ownerId: String = memKey,
+        images: List<String> = emptyList()
     ) {
         val cfg = Prefs.current
         val key = convKey(conv)
-        val messages = buildMessages(cfg, key, text, memKey, senderName, conv.isGroup)
+        val messages = buildMessages(cfg, key, text, memKey, senderName, conv.isGroup, images)
         val started = System.currentTimeMillis()
-        val chatCfg = modelFor(cfg, text)
+        val chatCfg = modelFor(cfg, images.isNotEmpty())
         var reply: String? = null
         var lastError = ""
         aiGate.withPermit {
@@ -854,6 +907,8 @@ object Brain {
         class DirPiece(val path: String) : Piece()
         /** 只贴清单，不发文件 —— 「让它列目录却把文件发过来」的根治点 */
         class ListPiece(val path: String) : Piece()
+        /** 现画一张图：走 image 槽位的生图接口，和 [FilePiece] 的「发本机图」是两回事 */
+        class ImagePiece(val prompt: String) : Piece()
     }
 
     private val markerRe = Regex(
@@ -861,7 +916,8 @@ object Brain {
             "|\\[(?:文件|图片)\\s*[:：]\\s*([^\\]]+)]" +
             "|\\[目录\\s*[:：]\\s*([^\\]]+)]" +
             "|\\[语音\\]\\s*([^\\n\\[]*)" +
-            "|\\[(?:列目录|目录清单|看看目录)\\s*[:：]?\\s*([^\\]\\n]*)]"
+            "|\\[(?:列目录|目录清单|看看目录)\\s*[:：]?\\s*([^\\]\\n]*)]" +
+            "|\\[(?:画图|绘图|生图|生成图片|画一张)\\s*[:：]\\s*([^\\]]+)]"
     )
 
     private fun parsePieces(reply: String): List<Piece> {
@@ -877,12 +933,14 @@ object Brain {
             val dir = match.groupValues[3]
             val voice = match.groupValues[4]
             val listing = match.groupValues[5]
+            val drawing = match.groupValues[6]
             when {
                 sticker.isNotBlank() -> out.add(Piece.StickerPiece(sticker))
                 file.isNotBlank() -> out.add(Piece.FilePiece(file))
                 dir.isNotBlank() -> out.add(Piece.DirPiece(dir))
                 voice.isNotBlank() -> out.add(Piece.VoicePiece(voice))
                 listing.isNotBlank() -> out.add(Piece.ListPiece(listing))
+                drawing.isNotBlank() -> out.add(Piece.ImagePiece(drawing))
             }
             cursor = match.range.last + 1
         }
@@ -965,6 +1023,11 @@ object Brain {
                     totalSent++
                     delay(300)
                 }
+                is Piece.ImagePiece -> {
+                    val ok = drawImage(conv, piece.prompt, cfg)
+                    if (ok) totalSent++
+                    delay(500)
+                }
             }
         }
     }
@@ -992,12 +1055,56 @@ object Brain {
             if (report) Sender.sendText(conv, "语音没开，先去应用里把 TTS 配上。")
             return
         }
-        runCatching { TtsApi.synthesize(text, cfg.tts) }
+        val script = voiceScript(text, cfg)
+        runCatching { TtsApi.synthesize(script, cfg.tts) }
             .onSuccess { audio -> Sender.sendVoice(conv, audio.bytes) }
             .onFailure {
                 Logs.e("语音合成失败：${it.message}")
                 if (report) Sender.sendText(conv, "语音没合成出来：${it.message?.take(60)}")
             }
+    }
+
+    /**
+     * 语音稿：`tts` 槽位填了才生效。
+     *
+     * 直接念聊天文字经常带表情符号、Markdown、颜文字，合成出来是噪音；
+     * 配了语音模型就先把这段过一遍，转成能念的口语。没配就原样念，零成本零风险。
+     */
+    private fun voiceScript(text: String, cfg: Config): String {
+        if (!cfg.routing.enabled || !cfg.routing.tts.filled) return text
+        val slot = runCatching { cfg.routing.effective(cfg.routing.tts, cfg.ai) }
+            .getOrDefault(cfg.ai)
+            .copy(temperature = 0.4, maxTokens = 200)
+        val msgs = listOf(
+            AiApi.Msg("system", "把下面这句改写成能直接念出来的口语：只输出要念的字，不加引号、不解释、不带表情符号和 Markdown，保持原意，别啰嗦。"),
+            AiApi.Msg("user", text)
+        )
+        val out = runCatching { AiApi.chat(msgs, slot) }.getOrNull()?.trim()
+        return if (out.isNullOrBlank()) text else out
+    }
+
+    /**
+     * 现画一张图并发出。
+     *
+     * 走 `image` 槽位；这一栏没填就回落到主模型那组（同一个中转站常常也能生图）。
+     * 任何失败都只回一句人话，不抛出去——画不出来不能把后面的消息链带崩。
+     */
+    private fun drawImage(conv: Conversation, prompt: String, cfg: Config): Boolean {
+        val clean = prompt.trim()
+        if (clean.isBlank()) return false
+        val slot = runCatching { cfg.routing.effective(cfg.routing.image, cfg.ai) }
+            .getOrDefault(cfg.ai)
+        return runCatching { ImageApi.generate(clean, slot) }
+            .onSuccess { img ->
+                val name = "draw-" + System.currentTimeMillis() + "." + img.ext
+                val ok = Sender.sendImageBytes(conv, img.bytes, name)
+                if (ok) Logs.i("→ 画图 ${img.ext} ${img.bytes.size / 1024}KB：${clean.take(30)}")
+            }
+            .onFailure {
+                Logs.e("画图失败：${it.message}")
+                Sender.sendText(conv, "画不出来：${it.message?.take(80)}")
+            }
+            .isSuccess
     }
 
     /* ---------------- 本地测试 ---------------- */

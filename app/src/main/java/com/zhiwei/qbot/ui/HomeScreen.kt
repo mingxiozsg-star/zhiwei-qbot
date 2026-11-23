@@ -177,7 +177,7 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
         QuickTile("🖼️", "表情包", "自己加图，AI 会挑着发", onClick = { onOpen("stickers") })
         QuickTile("📤", "文件发送", "图片、视频、语音、任意文件", onClick = { onOpen("files") })
         QuickTile("⌨️", "快捷指令", "自定义触发词，聊天里直接敲", onClick = { onOpen("shortcuts") })
-        QuickTile("🧩", "模型分配", "对话 / 推理 / 语音 / 画图各走各的", onClick = { onOpen("routing") })
+        QuickTile("🧩", "模型分配", "对话 / 识图 / 语音 / 画图各走各的", onClick = { onOpen("routing") })
         QuickTile("🗄️", "备份与恢复", "配置 + 记忆 + 表情整包导出", onClick = { onOpen("backup") })
 
         SectionTitle("系统")
@@ -321,7 +321,7 @@ fun SettingsScreen(onOpen: (String) -> Unit, onBack: () -> Unit) {
 
         SectionTitle("模型与数据")
         CardBox {
-            ActionRow("模型分配", "对话 / 推理 / 语音 / 画图") { onOpen("routing") }
+            ActionRow("模型分配", "对话 / 识图 / 语音 / 画图") { onOpen("routing") }
             Line()
             ActionRow("备份与恢复", "整包导出与还原") { onOpen("backup") }
         }

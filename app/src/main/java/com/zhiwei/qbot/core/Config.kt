@@ -180,21 +180,23 @@ data class ModelSlot(
  * 四类用途的模型。
  *
  * - [chat]：普通对话（必填，其它空着都回落到它）
- * - [subagent]：复杂任务/多步推理，比如「列出目录再挑一个发给我」
- * - [tts]：语音生成
- * - [image]：画图
+ * - [vision]：识图模型 —— 别人发来图片时，把图片喂给它看
+ * - [tts]：语音稿生成
+ * - [image]：画图（生图）
+ *
+ * 旧配置里这一栏叫 subagent（当时误当作「师徒/复杂推理」），读取时兼容迁移。
  */
 data class ModelRouting(
     val enabled: Boolean = false,
     val chat: ModelSlot = ModelSlot(),
-    val subagent: ModelSlot = ModelSlot(),
+    val vision: ModelSlot = ModelSlot(),
     val tts: ModelSlot = ModelSlot(),
     val image: ModelSlot = ModelSlot()
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("enabled", enabled)
         .put("chat", chat.toJson())
-        .put("subagent", subagent.toJson())
+        .put("vision", vision.toJson())
         .put("tts", tts.toJson())
         .put("image", image.toJson())
 
@@ -217,13 +219,17 @@ data class ModelRouting(
     }
 
     companion object {
-        fun from(o: JSONObject) = ModelRouting(
-            enabled = o.flag("enabled"),
-            chat = ModelSlot.from(o.obj("chat")),
-            subagent = ModelSlot.from(o.obj("subagent")),
-            tts = ModelSlot.from(o.obj("tts")),
-            image = ModelSlot.from(o.obj("image"))
-        )
+        fun from(o: JSONObject): ModelRouting {
+            // 兼容旧配置：v1.3.0 这一栏叫 subagent
+            val visionNode = o.obj("vision").takeIf { it.length() > 0 } ?: o.obj("subagent")
+            return ModelRouting(
+                enabled = o.flag("enabled"),
+                chat = ModelSlot.from(o.obj("chat")),
+                vision = ModelSlot.from(visionNode),
+                tts = ModelSlot.from(o.obj("tts")),
+                image = ModelSlot.from(o.obj("image"))
+            )
+        }
     }
 }
 

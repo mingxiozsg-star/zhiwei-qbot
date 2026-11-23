@@ -292,4 +292,26 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
             open()
         }
     }
+
+    /**
+     * 网络恢复时立刻重连。
+     *
+     * 退避已经排到 30 秒时，如果这期间 WiFi 恢复了，干等毫无意义；
+     * 息屏场景下这 30 秒的 delay 还可能被 Doze 拉长到几分钟。
+     * 这里直接把退避清零并立即开新连接。
+     */
+    fun connectNow(reason: String) {
+        if (!running) return
+        if (socket != null && System.currentTimeMillis() - lastAck < 30_000) return
+        Logs.i("立即重连：$reason")
+        attempt = 0
+        lastReconnectAt = 0
+        hbJob?.cancel()
+        hbJob = null
+        val old = socket
+        socket = null
+        runCatching { old?.cancel() }
+        Runtime.setState(Runtime.State.CONNECTING, reason)
+        scope?.launch(Dispatchers.IO) { open() }
+    }
 }

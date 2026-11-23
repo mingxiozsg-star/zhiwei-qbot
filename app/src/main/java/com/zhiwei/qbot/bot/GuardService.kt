@@ -1,6 +1,5 @@
 package com.zhiwei.qbot.bot
 
-import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,7 +10,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.zhiwei.qbot.MainActivity
 import com.zhiwei.qbot.R
@@ -87,7 +85,6 @@ class GuardService : Service() {
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var wakeLock: PowerManager.WakeLock? = null
 
     @Volatile private var running = true
 
@@ -98,11 +95,16 @@ class GuardService : Service() {
         createChannel()
         goForeground()
         acquireWakeLock()
+        // 守护进程自己也排闹钟：主进程死了、闹钟接收器又在主进程时，
+        // 这条独立进程里的闹钟就是最后一道保险
+        KeepAliveCore.schedule(this)
         scope.launch {
             var restarts = 0
             while (running) {
                 delay(CHECK_INTERVAL_MS)
                 if (!running) break
+                // 顺手续一次闹钟：进程被冻过之后原闹钟可能已经不在了
+                KeepAliveCore.schedule(this@GuardService)
                 if (!isMainServiceAlive()) {
                     // 没填凭证时拉起来也只是空转弹通知，等用户配好再管
                     val cfg = Prefs.current
@@ -143,30 +145,21 @@ class GuardService : Service() {
 
     /**
      * 主进程里的 BotService 是否还在。
-     * getRunningServices 在 Android 8+ 只返回自己应用的，正好够用。
+     *
+     * 不用 `getRunningServices`：Android 8+ 它只返回自己进程的服务，
+     * 而守护跑在 `:guard` 子进程，看到的永远只有它自己 → 恒判「主服务不在」，
+     * 于是每 20 秒无脑拉起一次，反而把主进程拖进「拉起 → 被杀 → 再拉起」的循环。
+     * 现在读主服务写的心跳文件，才是真的知道它还活不活。
      */
-    private fun isMainServiceAlive(): Boolean {
-        val am = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return true
-        val services = runCatching { am.getRunningServices(80) }.getOrNull() ?: return true
-        val mainService = BotService::class.java.name
-        return services.any { info ->
-            // RunningServiceInfo.process 是进程名：主进程就是包名本身
-            info.service.className == mainService && info.process == MAIN_PACKAGE
-        }
-    }
+    private fun isMainServiceAlive(): Boolean = KeepAliveCore.isAlive(this)
 
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "zhiwei:qbot-guard").apply {
-            setReferenceCounted(false)
-            runCatching { acquire(4 * 60 * 60 * 1000L) }
-        }
+        // 守护进程也要 WiFi 锁：它要定期探活，WiFi 被掐时同样判不出真假
+        KeepAliveCore.lock(this)
     }
 
     private fun releaseWakeLock() {
-        runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
-        wakeLock = null
+        KeepAliveCore.unlock()
     }
 
     private fun createChannel() {

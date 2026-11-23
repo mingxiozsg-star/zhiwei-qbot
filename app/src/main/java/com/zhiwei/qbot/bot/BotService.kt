@@ -8,9 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.zhiwei.qbot.MainActivity
 import com.zhiwei.qbot.R
@@ -43,6 +44,14 @@ class BotService : Service() {
         const val ACTION_RECONNECT = "com.zhiwei.qbot.RECONNECT"
         private const val CHANNEL = "qbot_running"
         private const val NOTIFY_ID = 1001
+
+        /**
+         * 服务是否活着。给同进程内的代码用；
+         * 跨进程（守护 :guard、闹钟）要读 [KeepAliveCore.isAlive] 的文件心跳，静态变量跨不过去。
+         */
+        @Volatile
+        var isRunning: Boolean = false
+            private set
 
         fun start(context: Context) {
             // 主服务与守护一起起来：守护在独立进程，负责主进程被回收后把它拉回来
@@ -85,9 +94,9 @@ class BotService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var gateway: Gateway? = null
-    private var wakeLock: PowerManager.WakeLock? = null
     private var stateJob: Job? = null
     private var guardJob: Job? = null
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var foreground = false
 
     @Volatile private var stopping = false
@@ -96,19 +105,43 @@ class BotService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         createChannel()
         goForeground("正在启动…")
         Brain.reconnectHook = { reconnectGateway("应用内请求") }
+        // 心跳：别的进程靠这个文件判断主服务死没死，比任何内存标记都可靠
+        KeepAliveCore.beat(this)
+        KeepAliveCore.schedule(this)
+        startNetworkWatch()
         stateJob = scope.launch {
             Runtime.snap.map { it.state }.distinctUntilChanged().collect { updateNotification() }
         }
         guardJob = scope.launch {
             while (!stopping) {
-                delay(45_000)
+                // 心跳与巡检同一个节拍，避免两处各自维护定时器
+                KeepAliveCore.beat(this@BotService)
+                delay(30_000)
                 if (stopping) break
                 keepAliveCheck()
             }
         }
+    }
+
+    /**
+     * 从最近任务划掉卡片时走这里。
+     * 不清心跳、不 stopSelf，并立刻把服务重新拉起来——用户划卡片是想清后台，不是想关机器人。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Logs.w("任务被划掉，尝试复活")
+        if (Prefs.current.autoStart) {
+            KeepAliveCore.beat(this)
+            KeepAliveCore.schedule(this)
+            runCatching {
+                val intent = Intent(this, BotService::class.java).setAction(ACTION_START)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+            }.onFailure { Logs.e("划掉后复活失败：${it.message}") }
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -119,12 +152,19 @@ class BotService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_RECONNECT -> {
-                reconnectGateway("通知栏/应用请求")
+                // 优先原地踢连接：重建网关会丢掉会话，代价大；
+                // 只有网关本身没了才真去重建。
+                val g = gateway
+                if (g != null && g.isRunning()) g.connectNow("外部请求重连") else reconnectGateway("外部请求重连")
                 return START_STICKY
             }
             else -> {
                 stopping = false
                 ensureRunning()
+                // 闹钟唤醒时 service 已经在跑，ensureRunning 会直接返回，
+                // 但长连接可能已经半死（socket 还在、ACK 早停了）。
+                // connectNow 只在 ACK 超过 30 秒没更新时才真重连，正好当「唤醒即体检」用。
+                gateway?.connectNow("保活唤醒")
             }
         }
         return START_STICKY
@@ -179,18 +219,56 @@ class BotService : Service() {
         ensureRunning()
     }
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "zhiwei:qbot").apply {
-            setReferenceCounted(false)
-            runCatching { acquire() }
+    /**
+     * 监听网络变化。
+     *
+     * 痛点：Gateway 的退避最多等 30 秒，Doze 下这个 delay 会被冻成几分钟甚至更久。
+     * WiFi 从「息屏省电断连」里恢复时，如果还在傻等退避，表现就是「网明明回来了，机器人还是不理人」。
+     * 这里在网络可用的一瞬间把连接踢醒，绕开退避。
+     */
+    private fun startNetworkWatch() {
+        if (netCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Logs.i("网络恢复，踢一下网关")
+                KeepAliveCore.beat(this@BotService)
+                gateway?.connectNow("网络恢复")
+            }
+
+            override fun onLost(network: Network) {
+                Logs.w("网络断开，等待恢复")
+                Runtime.setState(Runtime.State.RECONNECTING, "网络断开")
+            }
+        }
+        // 用 registerDefaultNetworkCallback：不关心具体是 WiFi 还是流量，
+        // 只要系统默认网络换了就该重连，交给系统判断比手写 NetworkRequest 更准
+        val ok = runCatching { cm.registerDefaultNetworkCallback(cb) }.isSuccess
+        if (ok) {
+            netCallback = cb
+        } else {
+            Logs.w("网络监听注册失败，退化为纯看门狗")
         }
     }
 
+    private fun stopNetworkWatch() {
+        val cb = netCallback ?: return
+        netCallback = null
+        runCatching {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            cm?.unregisterNetworkCallback(cb)
+        }
+    }
+
+    private fun acquireWakeLock() {
+        // 统一走 KeepAliveCore：CPU 锁 + WiFi 锁一起拿。
+        // 之前只拿 PARTIAL_WAKE_LOCK，息屏后 WiFi 会进省电模式掐掉长连接，
+        // 这才是「给了所有权限还是掉线」的真因之一。
+        KeepAliveCore.lock(this)
+    }
+
     private fun releaseWakeLock() {
-        runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
-        wakeLock = null
+        KeepAliveCore.unlock()
     }
 
     private fun createChannel() {
@@ -261,10 +339,14 @@ class BotService : Service() {
 
     private fun stopEverything() {
         stopping = true
+        isRunning = false
+        stopNetworkWatch()
         gateway?.stop()
         gateway = null
         foreground = false
         releaseWakeLock()
+        KeepAliveCore.cancel(this)
+        KeepAliveCore.clearBeat(this)
         Brain.reconnectHook = null
         stateJob?.cancel()
         guardJob?.cancel()
@@ -283,10 +365,18 @@ class BotService : Service() {
 
     override fun onDestroy() {
         stopping = true
+        isRunning = false
+        stopNetworkWatch()
         guardJob?.cancel()
         runCatching { gateway?.stop() }
         gateway = null
         releaseWakeLock()
+        // 只有用户明确点了停止才清心跳；被系统杀掉时不能清，
+        // 否则守护进程会以为「用户关了」，再也不拉起
+        if (!Prefs.current.autoStart) {
+            KeepAliveCore.cancel(this)
+            KeepAliveCore.clearBeat(this)
+        }
         Brain.reconnectHook = null
         Runtime.stop()
         super.onDestroy()
