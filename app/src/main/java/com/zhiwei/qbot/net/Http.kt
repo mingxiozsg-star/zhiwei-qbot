@@ -35,7 +35,6 @@ object Http {
             .writeTimeout(90, TimeUnit.SECONDS)
             .callTimeout(0, TimeUnit.SECONDS)
             .connectionPool(ConnectionPool(6, 5, TimeUnit.MINUTES))
-            .pingInterval(30, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
             .addInterceptor(Interceptor { chain ->
@@ -45,6 +44,23 @@ object Http {
                         .build()
                 )
             })
+            .build()
+    }
+
+    /**
+     * WebSocket 专用客户端：**不设 pingInterval**。
+     *
+     * 之前这里设了 30 秒 pingInterval，OkHttp 会自己发协议层 ping 帧；
+     * QQ 网关不按标准回 pong，OkHttp 就判定连接失效并主动 close，
+     * 表现就是「每隔一阵无缘无故断一次，然后重连」。
+     * 保活改由业务层 op1 心跳负责，这一层必须留空。
+     */
+    val wsClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .pingInterval(0, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
             .build()
     }
 

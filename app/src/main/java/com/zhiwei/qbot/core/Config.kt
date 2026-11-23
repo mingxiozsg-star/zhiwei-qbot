@@ -197,24 +197,32 @@ data class MemoryConfig(
     /** 总开关：关掉后不记新东西，也不往提示词里塞旧记忆 */
     val enabled: Boolean = true,
     /** 每个人最多留多少条 */
-    val maxNotes: Int = 60,
+    val maxNotes: Int = 400,
     /** 每次最多塞几条进提示词 */
-    val injectLimit: Int = 8,
+    val injectLimit: Int = 12,
     /** 从聊天里自动抠名字/喜好 */
-    val autoLearn: Boolean = true
+    val autoLearn: Boolean = true,
+    /** 每一条消息都落一条记忆（推荐开） */
+    val rememberAll: Boolean = true,
+    /** 每次最多塞几条原始对话进提示词 */
+    val recallMsgs: Int = 8
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("enabled", enabled)
         .put("maxNotes", maxNotes)
         .put("injectLimit", injectLimit)
         .put("autoLearn", autoLearn)
+        .put("rememberAll", rememberAll)
+        .put("recallMsgs", recallMsgs)
 
     companion object {
         fun from(o: JSONObject) = MemoryConfig(
             enabled = o.flag("enabled", true),
-            maxNotes = o.num("maxNotes", 60),
-            injectLimit = o.num("injectLimit", 8),
-            autoLearn = o.flag("autoLearn", true)
+            maxNotes = o.num("maxNotes", 400),
+            injectLimit = o.num("injectLimit", 12),
+            autoLearn = o.flag("autoLearn", true),
+            rememberAll = o.flag("rememberAll", true),
+            recallMsgs = o.num("recallMsgs", 8)
         )
     }
 }

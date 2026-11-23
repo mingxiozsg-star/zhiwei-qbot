@@ -31,13 +31,21 @@ jobs:
           KS_ALIAS: ${{ secrets.KEY_ALIAS }}
           KS_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
-            echo "KEYSTORE_PASSWORD=$KS_PASSWORD" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=$KS_ALIAS" >> "$GITHUB_ENV"
-            echo "KEY_PASSWORD=$KS_KEY_PASSWORD" >> "$GITHUB_ENV"
+          # 正式包必须用固定密钥签：签名一变，旧版就无法覆盖安装，用户只能卸载重装
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::缺少 KEYSTORE_BASE64，已中止。换签名的包会导致旧版无法覆盖安装。"
+            exit 1
           fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "KEYSTORE_PASSWORD=$KS_PASSWORD" >> "$GITHUB_ENV"
+          echo "KEY_ALIAS=$KS_ALIAS" >> "$GITHUB_ENV"
+          echo "KEY_PASSWORD=$KS_KEY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Verify signing cert
+        run: |
+          keytool -list -v -keystore "$KEYSTORE_FILE" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" \
+            | grep -E "Alias name|Owner|SHA256:"
 
       - name: Build release
         run: |

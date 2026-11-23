@@ -1,9 +1,15 @@
 import java.io.File
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+/** 正式签名是否就绪：环境变量给了密钥文件、且文件真的存在 */
+val hasReleaseKeystore: Boolean = run {
+    val path = System.getenv("KEYSTORE_FILE")
+    path != null && File(path).exists()
+}
+
 
 android {
     namespace = "com.zhiwei.qbot"
@@ -13,8 +19,8 @@ android {
         applicationId = "com.zhiwei.qbot"
         minSdk = 24
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2.0"
+        versionCode = 4
+        versionName = "1.2.1"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -40,12 +46,15 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // 有正式密钥就用正式密钥，没有就退回 debug 签名，保证 CI 产物可直接安装
-            signingConfig = if (signingConfigs.findByName("release") != null) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            /**
+             * 正式包**只用**正式密钥签名。
+             *
+             * 绝不允许退回 debug 签名：一旦签名换了，用户设备上的旧版就与新版签名冲突，
+             * 报「软件包与现有软件包存在冲突」，只能删掉重装并丢数据。
+             * 所以这里找不到 release 签名就干脆不给签名，并在下面拦一个 Gradle 异常，
+             * 让 CI 直接红掉，而不是悄悄产出一个换了签名的包。
+             */
+            signingConfigs.findByName("release")?.let { signingConfig = it }
         }
     }
     compileOptions {
@@ -59,6 +68,17 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+}
+
+// 正式包签名护栏：真正要出 release 包时才校验，debug 调试不受影响
+gradle.taskGraph.whenReady {
+    val wantsRelease = allTasks.any { it.name.contains("Release") }
+    if (wantsRelease && !hasReleaseKeystore) {
+        throw GradleException(
+            "release 构建缺少正式签名密钥（KEYSTORE_FILE / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD 未配置或密钥文件不存在）。" +
+                "已阻止构建：换签名的包会导致旧版无法覆盖安装、用户必须卸载重装。"
+        )
     }
 }
 

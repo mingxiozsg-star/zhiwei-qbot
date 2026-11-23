@@ -9,6 +9,7 @@ import com.zhiwei.qbot.net.AiApi
 import com.zhiwei.qbot.net.QqApi
 import com.zhiwei.qbot.net.TtsApi
 import com.zhiwei.qbot.util.DeviceInfo
+import com.zhiwei.qbot.util.FileBrowser
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,6 +20,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -53,23 +55,30 @@ object Brain {
     fun onDispatch(type: String, d: JSONObject) {
         when (type) {
             "GROUP_AT_MESSAGE_CREATE" -> {
-                val conv = Conversation(true, d.optString("group_openid"), d.optString("id"))
+                val groupId = d.optString("group_openid")
+                val conv = Conversation(true, groupId, d.optString("id"))
                 val author = d.optJSONObject("author")
+                // union_openid 是应用级唯一，跨群稳定；member_openid 每个群都不一样
                 handleMessage(
                     conv,
                     d.optString("content"),
+                    author?.optString("union_openid") ?: "",
                     author?.optString("member_openid") ?: "",
-                    author?.optString("member_name") ?: "群友"
+                    author?.optString("member_name") ?: "群友",
+                    "群·" + groupId.takeLast(4)
                 )
             }
             "C2C_MESSAGE_CREATE" -> {
                 val author = d.optJSONObject("author")
-                val conv = Conversation(false, author?.optString("user_openid") ?: "", d.optString("id"))
+                val userOpenId = author?.optString("user_openid") ?: ""
+                val conv = Conversation(false, userOpenId, d.optString("id"))
                 handleMessage(
                     conv,
                     d.optString("content"),
-                    author?.optString("user_openid") ?: "",
-                    author?.optString("username") ?: "对方"
+                    author?.optString("union_openid") ?: "",
+                    userOpenId,
+                    author?.optString("username") ?: "对方",
+                    "私聊"
                 )
             }
             "AT_MESSAGE_CREATE" -> Logs.i("频道消息暂不处理（本工具只接群聊与单聊）")
@@ -95,27 +104,46 @@ object Brain {
         return convLocks.computeIfAbsent(key) { Mutex() }
     }
 
-    private fun rememberPerson(senderId: String, senderName: String, text: String) {
-        if (!Prefs.current.memory.enabled) return
-        if (senderId.isBlank()) return
-        Memory.touch(senderId, senderName)
-        Memory.mineFromMessage(senderId, text)
+    /**
+     * 见到一个人：先把 [unionId]（跨群唯一）与 [openId]（群内唯一）归并成同一个人，
+     * 再更新资料、落一条原始对话。返回合并后的主键，供提示词与后续写入复用。
+     */
+    private fun rememberPerson(unionId: String, openId: String, senderName: String, text: String, scene: String): String {
+        if (!Prefs.current.memory.enabled) return openId
+        val key = Memory.resolve(unionId, openId).ifBlank { openId }
+        if (key.isBlank()) return ""
+        Memory.touch(key, senderName)
+        // 关键：每句话都落库，不再靠正则「抠喜好」，聊天记录本身就是记忆
+        if (Prefs.current.memory.rememberAll) {
+            Memory.rememberMsg(key, text, fromUser = true, scene = scene)
+        }
+        Memory.mineFromMessage(key, text)
+        return key
     }
 
-    private fun handleMessage(conv: Conversation, raw: String, senderId: String, senderName: String) {
+    private fun handleMessage(
+        conv: Conversation,
+        raw: String,
+        unionId: String,
+        openId: String,
+        senderName: String,
+        scene: String
+    ) {
         if (conv.openId.isBlank()) return
         val text = clean(raw)
         if (text.isBlank()) return
         Logs.i("[${if (conv.isGroup) "群" else "私聊"}] ${senderName.ifBlank { "某人" }}：${text.take(60)}")
-        rememberPerson(senderId, senderName, text)
+        val memKey = rememberPerson(unionId, openId, senderName, text, scene)
+        // 权限判定仍用平台原始 id（管理员列表里填的是 openid / union_openid）
+        val ownerId = openId.ifBlank { unionId }
         scope.launch {
             lockFor(convKey(conv)).withLock {
                 try {
-                    if (routeCommand(text, conv, senderId, senderName)) return@withLock
+                    if (routeCommand(text, conv, ownerId, senderName, memKey = memKey)) return@withLock
                     val cfg = Prefs.current
                     if (conv.isGroup && !cfg.aiGroup) return@withLock
                     if (!conv.isGroup && !cfg.aiC2c) return@withLock
-                    replyWithAi(conv, text, senderId, senderName)
+                    replyWithAi(conv, text, memKey, senderName, ownerId)
                 } catch (e: Exception) {
                     Logs.e("处理消息出错：${e.message}")
                 }
@@ -131,10 +159,12 @@ object Brain {
         val command = resolved?.optString("button_data")?.trim().orEmpty()
         val groupOpenId = d.optString("group_openid")
         val userOpenId = d.optString("user_openid").ifBlank { resolved?.optString("user_id") ?: "" }
+        val unionOpenId = resolved?.optString("union_openid") ?: d.optString("union_openid")
         val isGroup = groupOpenId.isNotBlank()
         val conv = Conversation(isGroup, if (isGroup) groupOpenId else userOpenId, interactionId)
         Logs.i("按钮回调：${command.ifBlank { "(空)" }}")
         if (command.isBlank()) return
+        val memKey = Memory.resolve(unionOpenId, userOpenId)
         scope.launch {
             lockFor(convKey(conv)).withLock {
                 try {
@@ -142,7 +172,7 @@ object Brain {
                     val cfg = Prefs.current
                     if (isGroup && !cfg.aiGroup) return@withLock
                     if (!isGroup && !cfg.aiC2c) return@withLock
-                    replyWithAi(conv, command, userOpenId, "群友")
+                    replyWithAi(conv, command, memKey, "群友", userOpenId)
                 } catch (e: Exception) {
                     Logs.e("处理按钮回调出错：${e.message}")
                 }
@@ -184,8 +214,8 @@ object Brain {
         return sb.toString()
     }
 
-    private fun myMemoryText(senderId: String): String {
-        val p = Memory.person(senderId)
+    private fun myMemoryText(memKey: String): String {
+        val p = Memory.person(memKey)
             ?: return "我这儿还没有你的资料，多聊几句就记住了。"
         val sb = StringBuilder()
         sb.append("我记得你：").append(p.displayName())
@@ -193,10 +223,13 @@ object Brain {
             sb.append("（也叫 ").append(p.names.filter { !it.equals(p.name, true) }.take(3).joinToString("、")).append("）")
         }
         sb.append('\n')
-        sb.append("聊过 ").append(p.msgCount).append(" 句｜第一次见 ")
-            .append(dateText(p.firstSeen)).append('\n')
+        sb.append("聊过 ").append(p.msgCount).append(" 句｜存了 ").append(p.msgs.size).append(" 条对话")
+        sb.append("｜第一次见 ").append(dateText(p.firstSeen)).append('\n')
+        if (p.aliasIds.isNotEmpty()) {
+            sb.append("在 ").append(p.aliasIds.size).append(" 个身份标识下认得你（换群也认）\n")
+        }
         if (p.notes.isEmpty()) {
-            sb.append("暂时没记下别的。想让我记，就说「/记住 你喜欢猫」。")
+            sb.append("提炼记忆暂时没有，但你说的每句话我都留着，随时能翻。")
         } else {
             p.notes.takeLast(10).forEachIndexed { i, n ->
                 sb.append(i + 1).append(". ").append(n.text).append('\n')
@@ -212,9 +245,10 @@ object Brain {
     private fun routeCommand(
         text: String,
         conv: Conversation,
-        senderId: String,
+        ownerId: String,
         senderName: String,
-        fromButton: Boolean = false
+        fromButton: Boolean = false,
+        memKey: String = ownerId
     ): Boolean {
         val cfg = Prefs.current
         val lower = text.lowercase()
@@ -233,6 +267,8 @@ object Brain {
             if (menu != null) Sender.sendMenu(conv, menu) else Sender.sendText(conv, "没这个菜单：$id")
             return true
         }
+        // 快捷指令：q / w / e / s 与自然语言「发送某某文档」
+        if (handleShortcut(text, conv, ownerId)) return true
 
         when {
             lower == "/状态" || lower == "状态" -> {
@@ -256,11 +292,12 @@ object Brain {
             }
             lower == "/重载" -> {
                 Prefs.saveNow()
+                Memory.saveNow()
                 Sender.sendText(conv, "配置已重载。")
                 return true
             }
             lower == "/重连" -> {
-                if (!isOwner(senderId)) {
+                if (!isOwner(ownerId)) {
                     Sender.sendText(conv, "重连只有管理员能动。")
                     return true
                 }
@@ -274,7 +311,7 @@ object Brain {
                 return true
             }
             lower.startsWith("/记忆库") -> {
-                if (!isOwner(senderId)) {
+                if (!isOwner(ownerId)) {
                     Sender.sendText(conv, "记忆库只有管理员能看。")
                     return true
                 }
@@ -285,15 +322,16 @@ object Brain {
                 }
                 val sb = StringBuilder("记忆库：").append(Memory.summaryLine()).append('\n')
                 people.take(8).forEach { p ->
-                    sb.append("· ").append(p.displayName()).append("（").append(p.notes.size).append(" 条，")
-                        .append(p.msgCount).append(" 句）\n")
+                    sb.append("· ").append(p.displayName()).append("（")
+                        .append(p.notes.size).append(" 条记忆，")
+                        .append(p.msgs.size).append(" 条对话）\n")
                 }
                 if (people.size > 8) sb.append("……还有 ").append(people.size - 8).append(" 人")
                 Sender.sendText(conv, sb.toString().trim())
                 return true
             }
             lower == "/记忆" -> {
-                Sender.sendText(conv, myMemoryText(senderId))
+                Sender.sendText(conv, myMemoryText(memKey))
                 return true
             }
             lower.startsWith("/记住") -> {
@@ -304,7 +342,7 @@ object Brain {
                 }
                 val parts = what.split('，', ',', '；', ';').map { it.trim() }.filter { it.isNotEmpty() }
                 var added = 0
-                parts.take(3).forEach { if (Memory.learn(senderId, it, "manual")) added++ }
+                parts.take(3).forEach { if (Memory.learn(memKey, it, "manual")) added++ }
                 Sender.sendText(
                     conv,
                     if (added > 0) "记下了（$added 条）。以后在群里也认得你。" else "这条我好像已经记过了。"
@@ -312,12 +350,12 @@ object Brain {
                 return true
             }
             lower == "/忘记" || lower == "/忘掉我" -> {
-                Memory.forget(senderId)
+                Memory.forget(memKey)
                 Sender.sendText(conv, "行，把你忘干净了。")
                 return true
             }
             lower.startsWith("/语音") -> {
-                if (!isOwner(senderId)) {
+                if (!isOwner(ownerId)) {
                     Sender.sendText(conv, "语音只有管理员能点。")
                     return true
                 }
@@ -341,7 +379,7 @@ object Brain {
                 return true
             }
             lower.startsWith("/文件") || lower.startsWith("/发送") -> {
-                if (!isOwner(senderId) && !cfg.send.fileForAll) {
+                if (!isOwner(ownerId) && !cfg.send.fileForAll) {
                     Sender.sendText(conv, "发文件只有管理员能用。")
                     return true
                 }
@@ -352,6 +390,7 @@ object Brain {
                         "发本机文件：/文件 /sdcard/Download/a.pdf\n" +
                             "发一整个目录：/文件 /sdcard/Download/资料\n" +
                             "发公网文件：/文件 https://…/a.zip\n" +
+                            "快捷写法：q 看文件 · w 找安装包 · e 发安装包 · s 发压缩包\n" +
                             "图片、视频、silk 语音、apk 都能发，其它按普通文件发。"
                     )
                     return true
@@ -364,7 +403,8 @@ object Brain {
                 if (main != null) Sender.sendMenu(conv, main)
                 else Sender.sendText(
                     conv,
-                    "指令：/状态 /记忆 /记住 内容 /忘记 /文件 路径或目录 /语音 文本 /表情 名字 /分句开 /分句关 /清除 /重连"
+                    "指令：/状态 /记忆 /记住 内容 /忘记 /文件 路径或目录 /语音 文本 /表情 名字 /分句开 /分句关 /清除 /重连\n" +
+                        "快捷：q 看文件 · w 找安装包 · e 发安装包 · s 发压缩包"
                 )
                 return true
             }
@@ -374,6 +414,185 @@ object Brain {
             return false
         }
         return false
+    }
+
+    /* ---------------- 快捷指令 ---------------- */
+
+    /**
+     * 单字母快捷指令，聊天里直接敲：
+     * - `q [目录]`      看本地文件列表，不给目录就看 /sdcard
+     * - `w [关键词]`    扫安装包（apk）
+     * - `e 路径/文件名`  直接把 apk 发出去
+     * - `s 目录 文件名`  把压缩包（或任意文件）发出去
+     *
+     * 另外还认「发送某某文档 / 照片 / 视频 / 压缩包 + 路径」这种自然说法。
+     * 返回 true 表示已经处理，不再进 AI。
+     */
+    private fun handleShortcut(text: String, conv: Conversation, senderId: String): Boolean {
+        val raw = text.trim()
+        if (raw.isEmpty()) return false
+        val lower = raw.lowercase(Locale.US)
+        val cmd = lower.substringBefore(' ').trim()
+        val arg = raw.substringAfter(' ', "").trim()
+
+        when (cmd) {
+            "q" -> {
+                val target = arg.ifBlank { "/sdcard" }
+                scope.launch {
+                    val body = runCatching { FileBrowser.listDirectory(target) }
+                        .getOrElse { "列不出来：${it.message}" }
+                    Sender.sendText(conv, body)
+                }
+                return true
+            }
+            "w" -> {
+                if (!canSendFile(senderId)) {
+                    Sender.sendText(conv, "发文件只有管理员能用。")
+                    return true
+                }
+                scope.launch {
+                    val body = runCatching {
+                        val list = if (arg.isBlank()) FileBrowser.findApks() else FileBrowser.findApks(arg)
+                        if (list.isEmpty()) {
+                            "没扫到安装包。" + (if (arg.isBlank()) "试试指定目录：w /sdcard/Download" else "换个关键词：w 微信")
+                        } else {
+                            buildString {
+                                append("📦 找到 ").append(list.size).append(" 个安装包：\n")
+                                list.forEachIndexed { i, f ->
+                                    append(i + 1).append(". ").append(f.name)
+                                        .append("（").append(FileBrowser.sizeOf(f)).append("）\n")
+                                    append("   ").append(f.absolutePath).append('\n')
+                                }
+                                append("发哪个就发：e ").append(list.first().absolutePath)
+                            }
+                        }
+                    }.getOrElse { "扫安装包出错：${it.message}" }
+                    Sender.sendText(conv, body)
+                }
+                return true
+            }
+            "e" -> {
+                if (!canSendFile(senderId)) {
+                    Sender.sendText(conv, "发安装包只有管理员能用。")
+                    return true
+                }
+                if (arg.isBlank()) {
+                    Sender.sendText(conv, "写法：e /sdcard/Download/app.apk\n或：e /sdcard/Download app.apk\n不知道有啥就先发 w")
+                    return true
+                }
+                scope.launch { sendByArg(conv, arg, preferApk = true) }
+                return true
+            }
+            "s" -> {
+                if (!canSendFile(senderId)) {
+                    Sender.sendText(conv, "发文件只有管理员能用。")
+                    return true
+                }
+                if (arg.isBlank()) {
+                    Sender.sendText(conv, "写法：s /sdcard/Download 资料.zip\n或：s /sdcard/Download/a.zip")
+                    return true
+                }
+                scope.launch { sendByArg(conv, arg, preferApk = false) }
+                return true
+            }
+        }
+        return handleNaturalSend(raw, conv, senderId)
+    }
+
+    private fun canSendFile(senderId: String): Boolean =
+        isOwner(senderId) || Prefs.current.send.fileForAll
+
+    /** `e` / `s` 的参数解析：整条路径 → 目录+文件名 → 关键词搜 */
+    private fun sendByArg(conv: Conversation, arg: String, preferApk: Boolean) {
+        val target = arg.trim().trim('"', '\'', '`')
+        if (target.startsWith("http://") || target.startsWith("https://")) {
+            Sender.sendFile(conv, target)
+            return
+        }
+        val direct = File(target)
+        if (direct.exists() && direct.isFile) {
+            Sender.sendFile(conv, direct.absolutePath)
+            return
+        }
+        if (direct.exists() && direct.isDirectory) {
+            Sender.sendDirectory(conv, direct.absolutePath)
+            return
+        }
+        // 目录 + 文件名："/sdcard/Download 资料.zip"
+        val parts = target.split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (parts.size >= 2 && parts.first().startsWith("/")) {
+            val dir = parts.first()
+            val name = parts.drop(1).joinToString(" ")
+            val hits = FileBrowser.findIn(dir, name)
+            if (hits.isNotEmpty()) {
+                if (hits.size > 1) {
+                    Sender.sendText(conv, "找到 ${hits.size} 个，先发最新的：${hits.first().name}")
+                }
+                Sender.sendFile(conv, hits.first().absolutePath)
+                return
+            }
+            Sender.sendText(conv, "目录里没找到「$name」：$dir\n先看看有什么：q $dir")
+            return
+        }
+        // 只有名字：按类型去常见目录找
+        val key = parts.joinToString(" ")
+        val hits = if (preferApk) {
+            val apks = FileBrowser.findApks(key)
+            if (apks.isEmpty()) FileBrowser.search(key, limit = 10) else apks
+        } else {
+            val archives = FileBrowser.findArchives().filter { it.name.contains(key, true) }
+            if (archives.isEmpty()) FileBrowser.search(key, limit = 10) else archives
+        }
+        if (hits.isEmpty()) {
+            Sender.sendText(conv, "没找到「$key」。\n看目录：q /sdcard/Download\n看安装包：w")
+            return
+        }
+        if (hits.size > 1) {
+            Sender.sendText(conv, "找到 ${hits.size} 个，先发这个：${hits.first().absolutePath}")
+        }
+        Sender.sendFile(conv, hits.first().absolutePath)
+    }
+
+    /**
+     * 自然语言发送：
+     * 「发送 /sdcard/Download/a.docx」「把照片 /sdcard/DCIM/a.jpg 发我」
+     * 「发个视频 b.mp4」「发送压缩包 /sdcard/Download/资料.zip」
+     */
+    private fun handleNaturalSend(raw: String, conv: Conversation, senderId: String): Boolean {
+        val t = raw.trim()
+        if (t.length > 200) return false
+        val verbs = listOf("发送", "发给我", "发给我吧", "发一下", "发个", "发一个", "给我发", "传给我", "传一下", "来一份", "来一张", "来一个")
+        val kinds = listOf("文档", "文件", "照片", "图片", "视频", "压缩包", "安装包", "apk", "音乐", "音频", "录音")
+        val hasVerb = verbs.any { t.contains(it, true) }
+        val kind = kinds.firstOrNull { t.contains(it, true) } ?: ""
+        if (!hasVerb && kind.isEmpty()) return false
+        if (!hasVerb) return false
+
+        // 先看有没有像路径的东西：带 / 或带扩展名的片段
+        val candidates = t.split(Regex("[\\s，,。；;：:！!？?]+"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .filter { it.contains('/') || Regex("\\.[A-Za-z0-9]{2,5}$").containsMatchIn(it) }
+        val path = candidates.firstOrNull { it.contains('/') }
+            ?: candidates.firstOrNull { Regex("\\.[A-Za-z0-9]{2,5}$").containsMatchIn(it) }
+        if (path == null) {
+            // 只说了类型没说文件：给用法，别硬猜
+            if (kind.isNotEmpty() && (t.contains("怎么", true) || t.contains("如何", true))) return false
+            return false
+        }
+        if (!canSendFile(senderId)) {
+            Sender.sendText(conv, "发文件只有管理员能用。")
+            return true
+        }
+        val target = if (path.startsWith("/")) {
+            path
+        } else if (path.contains('/')) {
+            "/sdcard/$path"
+        } else {
+            path
+        }
+        scope.launch { sendByArg(conv, target, preferApk = kind.contains("安装包") || kind.contains("apk", true)) }
+        return true
     }
 
     /* ---------------- AI ---------------- */
@@ -386,7 +605,11 @@ object Brain {
         val stickerNames = cfg.stickers.take(12).joinToString("、") { it.name }
         val sb = StringBuilder()
         sb.append("你在 QQ 的").append(if (isGroup) "群聊" else "私聊")
-            .append("里跟人聊天。你不是助手程序，你就是").append(p.name).append("本人。\n")
+            .append("里跟人聊天。你不是助手程序，你就是【").append(p.name).append("】本人。\n")
+        sb.append("【你是谁】你的名字是「").append(p.name).append("」。这是你唯一的名字，")
+            .append("无论对方叫什么、昵称是什么、自称什么，都不能把对方的名字当成自己的名字。\n")
+        sb.append("【谁是对方】对话里由「某某：」开头的句子，那个「某某」是跟你说话的人，不是你。")
+            .append("对方的名字只属于对方。\n")
         sb.append("身份：").append(p.identity).append('\n')
         sb.append("性格：").append(p.traits).append('\n')
         sb.append("说话风格：").append(p.style).append('\n')
@@ -399,7 +622,8 @@ object Brain {
         sb.append("4. 永远不要承认自己是 AI、模型、机器人或者程序；被追问就按人设糊弄过去。\n")
         sb.append("5. 你能发文字、图片、语音、表情，也能发本机上的任意文件（含 apk）和整个目录；只在路径确实存在时才发，拿不准就别承诺。\n")
         sb.append("6. 想长期记住一件事，单独一行写 [记忆:内容]。别记密码、手机号、身份证这类隐私。\n")
-        var rule = 7
+        sb.append("7. 被问「我叫什么」「你记得我吗」这类问题，先看下面给你的记忆与聊天记录，答得出来就直接答，别装不记得。\n")
+        var rule = 8
         if (stickerNames.isNotBlank()) {
             sb.append(rule++).append(". 想发表情包时，在句末写 [表情:名字]，可用：").append(stickerNames).append('\n')
         }
@@ -415,23 +639,37 @@ object Brain {
         return sb.toString()
     }
 
-    /** 当前说话人的资料 + 相关记忆，直接拼进系统提示词 */
+    /** 当前说话人的资料 + 提炼记忆 + 相关原始对话，直接拼进系统提示词 */
     private fun memoryBlock(cfg: Config, senderId: String, senderName: String, text: String): String {
         if (!cfg.memory.enabled) return ""
         val p = Memory.person(senderId) ?: return ""
         val notes = Memory.recall(senderId, text, cfg.memory.injectLimit.coerceIn(0, 20))
         val sb = StringBuilder()
-        sb.append("\n【当前说话的人】").append(p.displayName().ifBlank { senderName })
-        sb.append("（openid 尾号 ").append(senderId.takeLast(6)).append("）")
+        sb.append("\n【现在说话的人（不是你）】").append(p.displayName().ifBlank { senderName })
         if (p.names.size > 1) {
             val others = p.names.filter { !it.equals(p.name, true) }.take(3)
             if (others.isNotEmpty()) sb.append("，也叫 ").append(others.joinToString("、"))
         }
         sb.append("｜第一次见 ").append(dateText(p.firstSeen))
-        sb.append("｜已经聊过 ").append(p.msgCount).append(" 句\n")
+        sb.append("｜已经聊过 ").append(p.msgCount).append(" 句")
+        if (p.msgs.isNotEmpty()) sb.append("｜存了 ").append(p.msgs.size).append(" 条对话")
+        sb.append('\n')
+        sb.append("再强调一次：你的名字是「").append(cfg.persona.name).append("」，")
+            .append("上面这个名字是对方的，别弄反。\n")
         if (notes.isNotEmpty()) {
-            sb.append("【你记得他】\n")
+            sb.append("【你记得他的事】\n")
             notes.forEachIndexed { i, n -> sb.append(i + 1).append(". ").append(n).append('\n') }
+        }
+        if (cfg.memory.rememberAll) {
+            val history = Memory.recallMsgs(senderId, text, cfg.memory.recallMsgs.coerceIn(0, 20))
+            if (history.isNotEmpty()) {
+                sb.append("【你们聊过的原话（挑相关的）】\n")
+                history.forEach { m ->
+                    sb.append(if (m.fromUser) p.displayName() else cfg.persona.name)
+                        .append("[").append(Memory.dateText(m.at)).append("]：")
+                        .append(m.text.take(120)).append('\n')
+                }
+            }
         }
         return sb.toString()
     }
@@ -468,10 +706,16 @@ object Brain {
         }
     }
 
-    private suspend fun replyWithAi(conv: Conversation, text: String, senderId: String, senderName: String) {
+    private suspend fun replyWithAi(
+        conv: Conversation,
+        text: String,
+        memKey: String,
+        senderName: String,
+        ownerId: String = memKey
+    ) {
         val cfg = Prefs.current
         val key = convKey(conv)
-        val messages = buildMessages(cfg, key, text, senderId, senderName, conv.isGroup)
+        val messages = buildMessages(cfg, key, text, memKey, senderName, conv.isGroup)
         val started = System.currentTimeMillis()
         var reply: String? = null
         var lastError = ""
@@ -494,21 +738,25 @@ object Brain {
             return
         }
         Logs.i("模型 ${System.currentTimeMillis() - started}ms 返回 ${draft.length} 字")
-        val answer = harvestMemories(draft, senderId)
+        val answer = harvestMemories(draft, memKey)
         remember(cfg, key, text, answer, conv.isGroup, senderName)
+        // 机器人自己说的话也挂到这个人名下，形成完整对话串
+        if (cfg.memory.enabled && cfg.memory.rememberAll && memKey.isNotBlank()) {
+            Memory.rememberMsg(memKey, answer, fromUser = false, scene = if (conv.isGroup) "群" else "私聊")
+        }
         try {
-            deliver(conv, answer, cfg, senderId)
+            deliver(conv, answer, cfg, ownerId)
         } catch (e: Exception) {
             Logs.e("发送流程出错：${e.message}")
         }
     }
 
     /** 把模型写的 [记忆:xxx] 落库，并从要发出去的文字里删掉 */
-    private fun harvestMemories(reply: String, senderId: String): String {
+    private fun harvestMemories(reply: String, memKey: String): String {
         if (!Prefs.current.memory.enabled) return reply
         val re = Regex("\\[记忆\\s*[:：]\\s*([^\\]]+)]")
         val found = re.findAll(reply).map { it.groupValues[1].trim() }.filter { it.isNotEmpty() }.toList()
-        found.take(2).forEach { Memory.learn(senderId, it, "ai") }
+        found.take(2).forEach { Memory.learn(memKey, it, "ai") }
         if (found.isEmpty()) return reply
         Logs.i("模型记了 ${found.size} 条：${found.take(2).joinToString("；")}")
         return re.replace(reply, "").replace(Regex("\\n{3,}"), "\n\n").trim()

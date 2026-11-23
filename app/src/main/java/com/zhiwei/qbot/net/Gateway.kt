@@ -105,7 +105,7 @@ class Gateway(private val onDispatch: (String, JSONObject) -> Unit) {
                     currentUrl = url
                 }
                 val req = Request.Builder().url(url).build()
-                socket = Http.client.newWebSocket(req, listener)
+                socket = Http.wsClient.newWebSocket(req, listener)
             } catch (e: Exception) {
                 Logs.e("取网关失败：${e.message}")
                 reconnect("取网关失败")
