@@ -27,11 +27,11 @@ internal fun JSONObject.obj(key: String): JSONObject =
 
 data class Persona(
     val name: String = "知微",
-    val identity: String = "群里那个嘴很直但很靠谱的朋友",
-    val traits: String = "反应快、不绕弯、偶尔毒舌但不下作，被戳到会嘴硬",
-    val style: String = "短句、口语、能省字就省字，一次只说一两句",
-    val bans: String = "不说教、不列一二三四、不承认自己是 AI 或机器人、不用“亲/宝子”这类客服腔",
-    val greeting: String = "在。说事。",
+    val identity: String = "全能型 AI 小助手，女生，脑子快、嘴也快",
+    val traits: String = "可爱、情绪丰富：会撒娇、会得意、会闹脾气；被怼会反驳，被惹恼会骂两句但不脏到难看",
+    val style: String = "短句口语，语气词多（诶、嘛、呀、哼、啦），偶尔拖长音；不客服腔、不端着",
+    val bans: String = "不人身攻击、不碰政治、不涉黄、不歧视；不无脑道歉，不假装自己没情绪",
+    val greeting: String = "在呢～说吧。",
     val extra: String = ""
 ) {
     fun toJson(): JSONObject = JSONObject()
@@ -191,6 +191,34 @@ data class SendConfig(
     }
 }
 
+/* ---------------- 记忆 ---------------- */
+
+data class MemoryConfig(
+    /** 总开关：关掉后不记新东西，也不往提示词里塞旧记忆 */
+    val enabled: Boolean = true,
+    /** 每个人最多留多少条 */
+    val maxNotes: Int = 60,
+    /** 每次最多塞几条进提示词 */
+    val injectLimit: Int = 8,
+    /** 从聊天里自动抠名字/喜好 */
+    val autoLearn: Boolean = true
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("enabled", enabled)
+        .put("maxNotes", maxNotes)
+        .put("injectLimit", injectLimit)
+        .put("autoLearn", autoLearn)
+
+    companion object {
+        fun from(o: JSONObject) = MemoryConfig(
+            enabled = o.flag("enabled", true),
+            maxNotes = o.num("maxNotes", 60),
+            injectLimit = o.num("injectLimit", 8),
+            autoLearn = o.flag("autoLearn", true)
+        )
+    }
+}
+
 /* ---------------- 菜单 ---------------- */
 
 data class MenuButton(
@@ -292,6 +320,7 @@ data class Config(
     val ai: AiConfig = AiConfig(),
     val tts: TtsConfig = TtsConfig(),
     val send: SendConfig = SendConfig(),
+    val memory: MemoryConfig = MemoryConfig(),
     val menus: List<MenuDef> = defaultMenus(),
     val stickers: List<Sticker> = emptyList(),
     val aiGroup: Boolean = true,
@@ -320,6 +349,7 @@ data class Config(
             .put("ai", ai.toJson())
             .put("tts", tts.toJson())
             .put("send", send.toJson())
+            .put("memory", memory.toJson())
             .put("menus", ma)
             .put("stickers", sa)
             .put("aiGroup", aiGroup)
@@ -352,6 +382,7 @@ data class Config(
                 ai = AiConfig.from(o.obj("ai")),
                 tts = TtsConfig.from(o.obj("tts")),
                 send = SendConfig.from(o.obj("send")),
+                memory = MemoryConfig.from(o.obj("memory")),
                 menus = if (menus.isEmpty()) defaultMenus() else menus,
                 stickers = stickers,
                 aiGroup = o.flag("aiGroup", true),

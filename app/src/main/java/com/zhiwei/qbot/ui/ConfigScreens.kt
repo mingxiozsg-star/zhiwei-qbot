@@ -136,6 +136,7 @@ fun PersonaScreen(onBack: () -> Unit) {
             Field("禁止项", p.bans, { v -> Prefs.update { it.copy(persona = it.persona.copy(bans = v)) } }, singleLine = false, minLines = 3)
             Field("开场白", p.greeting, { v -> Prefs.update { it.copy(persona = it.persona.copy(greeting = v)) } }, singleLine = false, minLines = 2)
             Field("补充设定", p.extra, { v -> Prefs.update { it.copy(persona = it.persona.copy(extra = v)) } }, hint = "例子：喜欢叫对方“笨蛋”；只聊游戏和代码", singleLine = false, minLines = 3)
+            Hint("记忆会随聊天自动累积：聊熟的人会被记住，在群里被 @ 时也认得，不用每次重新自我介绍。")
         }
 
         SectionTitle("生效范围")
@@ -368,6 +369,7 @@ fun FilesScreen(onBack: () -> Unit) {
             Hint("本机文件：/文件 /sdcard/Download/报告.pdf")
             Hint("公网文件：/文件 https://example.com/a.zip（平台自己去拉，适合大文件）")
             Hint("让 AI 发：提示词里写 [文件:/sdcard/xxx.pdf]，路径必须真实存在。")
+            Hint("让 AI 发一整个目录：写 [目录:/sdcard/Download/某个文件夹]，会逐个发，并汇报发了几个。")
             Hint("图片、视频、silk 语音会自动按对应类型发，不用改写法。")
         }
 

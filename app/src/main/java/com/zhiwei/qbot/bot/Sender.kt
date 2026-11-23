@@ -257,6 +257,50 @@ object Sender {
         return fail(conv, "链接没发出去：平台拉不到这个地址，或该类型没开通。")
     }
 
+    /**
+     * 发送一整个目录下的文件。
+     * - 过滤隐藏文件与子目录，按文件名升序
+     * - 最多发 [maxCount] 个，避免被风控或刷屏
+     * - 目录为空或不存在时友好提示
+     * - 逐个发送并最后汇报战报
+     */
+    fun sendDirectory(conv: Conversation, path: String, maxCount: Int = 8): Boolean {
+        val dir = File(path)
+        if (!dir.exists()) {
+            return fail(conv, "目录不存在：$path")
+        }
+        if (!dir.isDirectory) {
+            // 如果传入的其实是个文件，直接发该文件
+            return sendFile(conv, path)
+        }
+        val files = dir.listFiles()
+            ?.filter { it.isFile && !it.name.startsWith(".") }
+            ?.sortedBy { it.name.lowercase() }
+            .orEmpty()
+
+        if (files.isEmpty()) {
+            return fail(conv, "目录是空的（没有普通文件）：${dir.name}")
+        }
+
+        val toSend = files.take(maxCount)
+        sendText(conv, "📁 准备发送目录「${dir.name}」中的文件（共 ${files.size} 个，本次发送前 ${toSend.size} 个）…")
+
+        var successCount = 0
+        var failCount = 0
+        for (f in toSend) {
+            // 逐个发文件，中间留小间隔避免平台频控
+            val ok = sendFile(conv, f.absolutePath)
+            if (ok) successCount++ else failCount++
+            try { Thread.sleep(600) } catch (_: InterruptedException) {}
+        }
+
+        val summary = "📁 目录「${dir.name}」发送完毕：成功 $successCount 个" +
+            (if (failCount > 0) "，失败 $failCount 个" else "") +
+            (if (files.size > toSend.size) "（余下 ${files.size - toSend.size} 个已跳过）" else "")
+        sendText(conv, summary)
+        return successCount > 0
+    }
+
     private fun fail(conv: Conversation, message: String): Boolean {
         Logs.e(message)
         sendText(conv, message)

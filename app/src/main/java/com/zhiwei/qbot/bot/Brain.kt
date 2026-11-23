@@ -2,11 +2,13 @@ package com.zhiwei.qbot.bot
 
 import com.zhiwei.qbot.core.Config
 import com.zhiwei.qbot.core.Logs
+import com.zhiwei.qbot.core.Memory
 import com.zhiwei.qbot.core.Prefs
 import com.zhiwei.qbot.core.Sticker
 import com.zhiwei.qbot.net.AiApi
 import com.zhiwei.qbot.net.QqApi
 import com.zhiwei.qbot.net.TtsApi
+import com.zhiwei.qbot.util.DeviceInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -17,16 +19,24 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 
 /**
  * 消息大脑：事件 -> 指令 or AI -> 分句 -> 发出去。
  *
+ * 记忆分三层：
+ * 1. 短期上下文：每个会话一份滑动窗口；
+ * 2. 长期记忆：按人存（Memory），群聊私聊共用，所以私聊聊熟的人在群里也认得；
+ * 3. 提示词注入：当前说话人的资料 + 和这句话最相关的几条记忆。
+ *
  * 稳定性约定：
- * 1. 同一会话串行处理（Mutex），并发消息不会把被动回复次数搅乱；
- * 2. 全局同时最多 4 个模型请求（Semaphore），避免手机端打爆接口；
- * 3. 模型请求失败自动重试 3 次（指数退避），全失败才回一句人话；
+ * 1. 同一会话串行（Mutex），并发消息不会把被动回复次数搅乱；
+ * 2. 全局最多 4 个模型请求（Semaphore）；
+ * 3. 模型失败重试 3 次（指数退避），全失败才回一句人话；
  * 4. 发送流程整体 try/catch，单条消息出错不影响下一条。
  */
 object Brain {
@@ -85,11 +95,19 @@ object Brain {
         return convLocks.computeIfAbsent(key) { Mutex() }
     }
 
+    private fun rememberPerson(senderId: String, senderName: String, text: String) {
+        if (!Prefs.current.memory.enabled) return
+        if (senderId.isBlank()) return
+        Memory.touch(senderId, senderName)
+        Memory.mineFromMessage(senderId, text)
+    }
+
     private fun handleMessage(conv: Conversation, raw: String, senderId: String, senderName: String) {
         if (conv.openId.isBlank()) return
         val text = clean(raw)
         if (text.isBlank()) return
         Logs.i("[${if (conv.isGroup) "群" else "私聊"}] ${senderName.ifBlank { "某人" }}：${text.take(60)}")
+        rememberPerson(senderId, senderName, text)
         scope.launch {
             lockFor(convKey(conv)).withLock {
                 try {
@@ -154,6 +172,43 @@ object Brain {
         return owners.any { it == senderId }
     }
 
+    private fun statusText(): String {
+        val s = Runtime.snap.value
+        val sb = StringBuilder(DeviceInfo.statusText())
+        sb.append("\n")
+        sb.append("在线 ").append(DeviceInfo.duration(System.currentTimeMillis() - s.since))
+        sb.append("｜线路 ").append(s.gateway.ifBlank { "-" }).append('\n')
+        sb.append("收发 收 ").append(s.received).append("｜发 ").append(s.sent)
+        sb.append("｜失败 ").append(s.fails).append('\n')
+        sb.append("记忆 ").append(Memory.summaryLine())
+        return sb.toString()
+    }
+
+    private fun myMemoryText(senderId: String): String {
+        val p = Memory.person(senderId)
+            ?: return "我这儿还没有你的资料，多聊几句就记住了。"
+        val sb = StringBuilder()
+        sb.append("我记得你：").append(p.displayName())
+        if (p.names.size > 1) {
+            sb.append("（也叫 ").append(p.names.filter { !it.equals(p.name, true) }.take(3).joinToString("、")).append("）")
+        }
+        sb.append('\n')
+        sb.append("聊过 ").append(p.msgCount).append(" 句｜第一次见 ")
+            .append(dateText(p.firstSeen)).append('\n')
+        if (p.notes.isEmpty()) {
+            sb.append("暂时没记下别的。想让我记，就说「/记住 你喜欢猫」。")
+        } else {
+            p.notes.takeLast(10).forEachIndexed { i, n ->
+                sb.append(i + 1).append(". ").append(n.text).append('\n')
+            }
+            if (p.notes.size > 10) sb.append("……还有 ").append(p.notes.size - 10).append(" 条")
+        }
+        return sb.toString().trim()
+    }
+
+    private fun dateText(at: Long): String =
+        runCatching { SimpleDateFormat("MM-dd", Locale.CHINA).format(Date(at)) }.getOrDefault("-")
+
     private fun routeCommand(
         text: String,
         conv: Conversation,
@@ -181,11 +236,7 @@ object Brain {
 
         when {
             lower == "/状态" || lower == "状态" -> {
-                val s = Runtime.snap.value
-                Sender.sendText(
-                    conv,
-                    "在线：${s.detail}\n收 ${s.received} 条｜发 ${s.sent} 条｜失败 ${s.fails} 次\n线路：${s.gateway.ifBlank { "-" }}"
-                )
+                Sender.sendText(conv, statusText())
                 return true
             }
             lower == "/分句开" -> {
@@ -200,7 +251,7 @@ object Brain {
             }
             lower == "/清除" || lower == "/重置" -> {
                 synchronized(historyLock) { histories.remove(convKey(conv)) }
-                Sender.sendText(conv, "这段对话的记忆清了。")
+                Sender.sendText(conv, "这段对话的记忆清了。（长期记忆还在，发 /忘记 才删）")
                 return true
             }
             lower == "/重载" -> {
@@ -220,6 +271,49 @@ object Brain {
                     hook.invoke()
                     Sender.sendText(conv, "已断开重连。")
                 }
+                return true
+            }
+            lower.startsWith("/记忆库") -> {
+                if (!isOwner(senderId)) {
+                    Sender.sendText(conv, "记忆库只有管理员能看。")
+                    return true
+                }
+                val people = Memory.allPeople()
+                if (people.isEmpty()) {
+                    Sender.sendText(conv, "记忆库是空的。")
+                    return true
+                }
+                val sb = StringBuilder("记忆库：").append(Memory.summaryLine()).append('\n')
+                people.take(8).forEach { p ->
+                    sb.append("· ").append(p.displayName()).append("（").append(p.notes.size).append(" 条，")
+                        .append(p.msgCount).append(" 句）\n")
+                }
+                if (people.size > 8) sb.append("……还有 ").append(people.size - 8).append(" 人")
+                Sender.sendText(conv, sb.toString().trim())
+                return true
+            }
+            lower == "/记忆" -> {
+                Sender.sendText(conv, myMemoryText(senderId))
+                return true
+            }
+            lower.startsWith("/记住") -> {
+                val what = text.substring(3).trim()
+                if (what.isBlank()) {
+                    Sender.sendText(conv, "写法：/记住 你喜欢猫，讨厌加班")
+                    return true
+                }
+                val parts = what.split('，', ',', '；', ';').map { it.trim() }.filter { it.isNotEmpty() }
+                var added = 0
+                parts.take(3).forEach { if (Memory.learn(senderId, it, "manual")) added++ }
+                Sender.sendText(
+                    conv,
+                    if (added > 0) "记下了（$added 条）。以后在群里也认得你。" else "这条我好像已经记过了。"
+                )
+                return true
+            }
+            lower == "/忘记" || lower == "/忘掉我" -> {
+                Memory.forget(senderId)
+                Sender.sendText(conv, "行，把你忘干净了。")
                 return true
             }
             lower.startsWith("/语音") -> {
@@ -256,8 +350,9 @@ object Brain {
                     Sender.sendText(
                         conv,
                         "发本机文件：/文件 /sdcard/Download/a.pdf\n" +
+                            "发一整个目录：/文件 /sdcard/Download/资料\n" +
                             "发公网文件：/文件 https://…/a.zip\n" +
-                            "图片、视频、silk 语音会按对应类型发，其它一律当文件。"
+                            "图片、视频、silk 语音、apk 都能发，其它按普通文件发。"
                     )
                     return true
                 }
@@ -269,7 +364,7 @@ object Brain {
                 if (main != null) Sender.sendMenu(conv, main)
                 else Sender.sendText(
                     conv,
-                    "指令：/状态 /语音 文本 /表情 名字 /文件 路径或链接 /分句开 /分句关 /清除 /重连"
+                    "指令：/状态 /记忆 /记住 内容 /忘记 /文件 路径或目录 /语音 文本 /表情 名字 /分句开 /分句关 /清除 /重连"
                 )
                 return true
             }
@@ -290,18 +385,21 @@ object Brain {
         val p = cfg.persona
         val stickerNames = cfg.stickers.take(12).joinToString("、") { it.name }
         val sb = StringBuilder()
-        sb.append("你在 QQ 的").append(if (isGroup) "群聊" else "私聊").append("里跟人聊天。你不是助手，你就是").append(p.name).append("本人。\n")
+        sb.append("你在 QQ 的").append(if (isGroup) "群聊" else "私聊")
+            .append("里跟人聊天。你不是助手程序，你就是").append(p.name).append("本人。\n")
         sb.append("身份：").append(p.identity).append('\n')
         sb.append("性格：").append(p.traits).append('\n')
         sb.append("说话风格：").append(p.style).append('\n')
-        sb.append("别做这些：").append(p.bans).append("\n")
-        sb.append("硬性规则：\n")
+        sb.append("不做这些：").append(p.bans).append("\n")
+        sb.append("你是有情绪的人：会被逗笑、会撒娇、会不服气地反驳、被冒犯会生气，必要时骂两句；不是每句都顺着对方。\n")
+        sb.append("\n硬性规则：\n")
         sb.append("1. 只输出要发到聊天框里的字，不要解释、不要旁白、不要用括号写动作、不要加引号。\n")
         sb.append("2. 一次最多三句，总共别超过 80 字；想多说就自然拆几句。\n")
-        sb.append("3. 口语化、短句，能省字就省字；不寒暄，不问“还有什么可以帮你”。\n")
+        sb.append("3. 口语化、短句，能省字就省字；不客服腔，不问“还有什么可以帮你”。\n")
         sb.append("4. 永远不要承认自己是 AI、模型、机器人或者程序；被追问就按人设糊弄过去。\n")
-        sb.append("5. 你可以发文字、图片、语音、表情，也可以发本机上的任意文件；但只在路径确实存在时才发，拿不准就别承诺。\n")
-        var rule = 6
+        sb.append("5. 你能发文字、图片、语音、表情，也能发本机上的任意文件（含 apk）和整个目录；只在路径确实存在时才发，拿不准就别承诺。\n")
+        sb.append("6. 想长期记住一件事，单独一行写 [记忆:内容]。别记密码、手机号、身份证这类隐私。\n")
+        var rule = 7
         if (stickerNames.isNotBlank()) {
             sb.append(rule++).append(". 想发表情包时，在句末写 [表情:名字]，可用：").append(stickerNames).append('\n')
         }
@@ -309,16 +407,46 @@ object Brain {
             sb.append(rule++).append(". 想发语音时，单独一行写 [语音]要说的话。\n")
         }
         sb.append(rule++).append(". 想发本机图片时，单独一行写 [图片:/sdcard/xxx.jpg]。\n")
-        sb.append(rule++).append(". 想发本机文件（pdf/zip/apk/docx 等任意类型）时，单独一行写 [文件:/sdcard/xxx.pdf]，路径必须真实存在；一次最多一个。\n")
+        sb.append(rule++).append(". 想发本机文件时，单独一行写 [文件:/sdcard/xxx.pdf]，一次最多一个。\n")
+        sb.append(rule++).append(". 想发一整个目录时，单独一行写 [目录:/sdcard/Download/某个文件夹]。\n")
         sb.append(rule).append(". 不要输出 Markdown、不要列清单、不要用标题。\n")
         if (p.extra.isNotBlank()) sb.append("补充设定：").append(p.extra).append('\n')
         if (cfg.ai.extraPrompt.isNotBlank()) sb.append("额外要求：").append(cfg.ai.extraPrompt).append('\n')
         return sb.toString()
     }
 
-    private fun buildMessages(cfg: Config, key: String, text: String, senderName: String, isGroup: Boolean): List<AiApi.Msg> {
+    /** 当前说话人的资料 + 相关记忆，直接拼进系统提示词 */
+    private fun memoryBlock(cfg: Config, senderId: String, senderName: String, text: String): String {
+        if (!cfg.memory.enabled) return ""
+        val p = Memory.person(senderId) ?: return ""
+        val notes = Memory.recall(senderId, text, cfg.memory.injectLimit.coerceIn(0, 20))
+        val sb = StringBuilder()
+        sb.append("\n【当前说话的人】").append(p.displayName().ifBlank { senderName })
+        sb.append("（openid 尾号 ").append(senderId.takeLast(6)).append("）")
+        if (p.names.size > 1) {
+            val others = p.names.filter { !it.equals(p.name, true) }.take(3)
+            if (others.isNotEmpty()) sb.append("，也叫 ").append(others.joinToString("、"))
+        }
+        sb.append("｜第一次见 ").append(dateText(p.firstSeen))
+        sb.append("｜已经聊过 ").append(p.msgCount).append(" 句\n")
+        if (notes.isNotEmpty()) {
+            sb.append("【你记得他】\n")
+            notes.forEachIndexed { i, n -> sb.append(i + 1).append(". ").append(n).append('\n') }
+        }
+        return sb.toString()
+    }
+
+    private fun buildMessages(
+        cfg: Config,
+        key: String,
+        text: String,
+        senderId: String,
+        senderName: String,
+        isGroup: Boolean
+    ): List<AiApi.Msg> {
         val list = ArrayList<AiApi.Msg>()
-        list.add(AiApi.Msg("system", buildSystemPrompt(cfg, isGroup)))
+        val system = buildSystemPrompt(cfg, isGroup) + memoryBlock(cfg, senderId, senderName, text)
+        list.add(AiApi.Msg("system", system))
         synchronized(historyLock) {
             histories[key]?.takeLast(cfg.ai.history.coerceIn(0, 40))?.let { list.addAll(it) }
         }
@@ -343,7 +471,7 @@ object Brain {
     private suspend fun replyWithAi(conv: Conversation, text: String, senderId: String, senderName: String) {
         val cfg = Prefs.current
         val key = convKey(conv)
-        val messages = buildMessages(cfg, key, text, senderName, conv.isGroup)
+        val messages = buildMessages(cfg, key, text, senderId, senderName, conv.isGroup)
         val started = System.currentTimeMillis()
         var reply: String? = null
         var lastError = ""
@@ -359,19 +487,31 @@ object Brain {
                 }
             }
         }
-        val answer = reply
-        if (answer == null) {
+        val draft = reply
+        if (draft == null) {
             Logs.e("模型最终失败：$lastError")
             Sender.sendText(conv, "等一下，脑子卡了一下。")
             return
         }
-        Logs.i("模型 ${System.currentTimeMillis() - started}ms 返回 ${answer.length} 字")
+        Logs.i("模型 ${System.currentTimeMillis() - started}ms 返回 ${draft.length} 字")
+        val answer = harvestMemories(draft, senderId)
         remember(cfg, key, text, answer, conv.isGroup, senderName)
         try {
             deliver(conv, answer, cfg, senderId)
         } catch (e: Exception) {
             Logs.e("发送流程出错：${e.message}")
         }
+    }
+
+    /** 把模型写的 [记忆:xxx] 落库，并从要发出去的文字里删掉 */
+    private fun harvestMemories(reply: String, senderId: String): String {
+        if (!Prefs.current.memory.enabled) return reply
+        val re = Regex("\\[记忆\\s*[:：]\\s*([^\\]]+)]")
+        val found = re.findAll(reply).map { it.groupValues[1].trim() }.filter { it.isNotEmpty() }.toList()
+        found.take(2).forEach { Memory.learn(senderId, it, "ai") }
+        if (found.isEmpty()) return reply
+        Logs.i("模型记了 ${found.size} 条：${found.take(2).joinToString("；")}")
+        return re.replace(reply, "").replace(Regex("\\n{3,}"), "\n\n").trim()
     }
 
     /* ---------------- 出站 ---------------- */
@@ -381,11 +521,13 @@ object Brain {
         class StickerPiece(val name: String) : Piece()
         class VoicePiece(val text: String) : Piece()
         class FilePiece(val path: String) : Piece()
+        class DirPiece(val path: String) : Piece()
     }
 
     private val markerRe = Regex(
         "\\[(?:表情|表情包|贴纸)\\s*[:：]\\s*([^\\]]+)]" +
             "|\\[(?:文件|图片)\\s*[:：]\\s*([^\\]]+)]" +
+            "|\\[目录\\s*[:：]\\s*([^\\]]+)]" +
             "|\\[语音\\]\\s*([^\\n\\[]*)"
     )
 
@@ -399,10 +541,12 @@ object Brain {
             }
             val sticker = match.groupValues[1]
             val file = match.groupValues[2]
-            val voice = match.groupValues[3]
+            val dir = match.groupValues[3]
+            val voice = match.groupValues[4]
             when {
                 sticker.isNotBlank() -> out.add(Piece.StickerPiece(sticker))
                 file.isNotBlank() -> out.add(Piece.FilePiece(file))
+                dir.isNotBlank() -> out.add(Piece.DirPiece(dir))
                 voice.isNotBlank() -> out.add(Piece.VoicePiece(voice))
             }
             cursor = match.range.last + 1
@@ -418,7 +562,7 @@ object Brain {
     private suspend fun deliver(conv: Conversation, rawReply: String, cfg: Config, senderId: String) {
         val pieces = parsePieces(rawReply)
         var totalSent = 0
-        val maxTotal = 8
+        val maxTotal = 10
         val textLimit = if (cfg.send.split) cfg.send.maxSegments.coerceIn(1, 8) else 8
         var textSent = 0
         var exit = false
@@ -469,6 +613,15 @@ object Brain {
                     totalSent++
                     delay(500)
                 }
+                is Piece.DirPiece -> {
+                    if (isOwner(senderId) || Prefs.current.send.fileForAll) {
+                        Sender.sendDirectory(conv, piece.path)
+                    } else {
+                        Logs.w("非管理员请求发目录，已忽略：${piece.path}")
+                    }
+                    totalSent++
+                    delay(500)
+                }
             }
         }
     }
@@ -508,7 +661,7 @@ object Brain {
 
     fun testReply(text: String): Result<List<String>> = runCatching {
         val cfg = Prefs.current
-        val messages = buildMessages(cfg, "test:local", text, "我", false)
+        val messages = buildMessages(cfg, "test:local", text, "test:local", "我", false)
         val reply = AiApi.chat(messages, cfg.ai)
         remember(cfg, "test:local", text, reply, false, "我")
         if (cfg.send.split) Splitter.split(reply, cfg.send.maxSegments, cfg.send.maxChars) else listOf(reply)
@@ -529,5 +682,7 @@ object Brain {
     }
 
     /** 设置页里直接看当前生效的系统提示词 */
-    fun previewPrompt(isGroup: Boolean = true): String = buildSystemPrompt(Prefs.current, isGroup)
+    fun previewPrompt(isGroup: Boolean = true): String =
+        buildSystemPrompt(Prefs.current, isGroup) +
+            memoryBlock(Prefs.current, "preview", "预览", "")
 }

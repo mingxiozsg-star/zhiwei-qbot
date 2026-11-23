@@ -109,6 +109,8 @@ fun GuideScreen(onBack: () -> Unit, onOpen: (String) -> Unit) {
             Line()
             ActionRow("表情包", "自己加图，AI 会挑着发") { onOpen("stickers") }
             Line()
+            ActionRow("记忆库", "按人记，群聊私聊都认得") { onOpen("memory") }
+            Line()
             ActionRow("语音 TTS", "自配接口，发真语音") { onOpen("voice") }
             Line()
             ActionRow("回复与分句", "一句一句往外蹦，像真人") { onOpen("send") }
@@ -117,14 +119,19 @@ fun GuideScreen(onBack: () -> Unit, onOpen: (String) -> Unit) {
         SectionTitle("群里的常规操作")
         CardBox {
             Hint("/菜单 —— 弹出按钮菜单（没开通按钮权限会退回文字菜单）")
-            Hint("/状态 —— 看在线时长、收发计数、当前线路")
+            Hint("/状态 —— 看运行平台、设备状态、收发计数、记忆统计")
+            Hint("/记忆 —— 看机器人记得你的哪些事")
+            Hint("/记住 你喜欢猫 —— 让它记一条（最多 3 条）")
+            Hint("/忘记 —— 删掉它对你的全部记忆")
+            Hint("/记忆库 —— 管理员看记忆库概况（仅管理员）")
             Hint("/语音 你好呀 —— 让机器人说一句（仅管理员）")
             Hint("/表情 名字 —— 发指定表情")
-            Hint("/文件 /sdcard/xxx.pdf —— 发本机文件，图片/视频/语音/任意文件都行")
+            Hint("/文件 /sdcard/xxx.pdf —— 发本机文件，图片/视频/语音/apk 都能发")
+            Hint("/文件 /sdcard/Download/资料 —— 发一整个目录")
             Hint("/文件 https://…/a.zip —— 发公网文件，大文件走这条")
             Hint("/分句开、/分句关 —— 临时改发送方式")
             Hint("/重连 —— 连接不对劲时手动重建（仅管理员）")
-            Hint("/清除 —— 清掉这段对话的记忆")
+            Hint("/清除 —— 清掉这段对话的记忆（长期记忆不受影响）")
         }
 
         SectionTitle("出问题了先看这里")

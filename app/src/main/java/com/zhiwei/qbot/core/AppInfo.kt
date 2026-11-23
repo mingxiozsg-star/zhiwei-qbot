@@ -6,7 +6,7 @@ package com.zhiwei.qbot.core
  */
 object AppInfo {
 
-    const val VERSION = "1.1.0"
+    const val VERSION = "1.2.0"
 
     const val REPO = "https://github.com/mingxiozsg-star/zhiwei-qbot"
     const val OWNER = "https://github.com/mingxiozsg-star"

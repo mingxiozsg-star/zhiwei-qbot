@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.sp
 import com.zhiwei.qbot.bot.BotService
 import com.zhiwei.qbot.bot.Runtime
 import com.zhiwei.qbot.core.AppInfo
+import com.zhiwei.qbot.core.Memory
 import com.zhiwei.qbot.core.Prefs
 import com.zhiwei.qbot.net.AiApi
 import com.zhiwei.qbot.net.QqApi
@@ -169,6 +170,7 @@ fun HomeScreen(onOpen: (String) -> Unit, onTalk: () -> Unit) {
         SectionTitle("配置")
         QuickTile("🔌", "接入与连接", "AppID / 密钥 / 备用线路", onClick = { onOpen("connect") })
         QuickTile("🪪", "人设与回复", "性格、语气、开场白、分句", onClick = { onOpen("persona") })
+        QuickTile("💾", "记忆库", "按人记，群聊私聊都认得", onClick = { onOpen("memory") })
         QuickTile("⌨️", "菜单按钮", "像图片那样发按钮菜单", onClick = { onOpen("menus") })
         QuickTile("🧠", "模型接口", "OpenAI 兼容格式", onClick = { onOpen("ai") })
         QuickTile("🗣️", "语音 TTS", "自配接口，发真语音", onClick = { onOpen("voice") })
@@ -290,6 +292,8 @@ fun SettingsScreen(onOpen: (String) -> Unit, onBack: () -> Unit) {
         SectionTitle("机器人")
         CardBox {
             ActionRow("人设与回复", cfg.persona.name) { onOpen("persona") }
+            Line()
+            ActionRow("记忆库", Memory.summaryLine()) { onOpen("memory") }
             Line()
             ActionRow("回复与分句", if (cfg.send.split) "分句已开 · 最多 ${cfg.send.maxSegments} 段" else "整段发送") { onOpen("send") }
             Line()

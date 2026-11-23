@@ -15,6 +15,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import com.zhiwei.qbot.core.Memory
 import com.zhiwei.qbot.core.Prefs
 import com.zhiwei.qbot.ui.AboutScreen
 import com.zhiwei.qbot.ui.AiScreen
@@ -26,6 +27,7 @@ import com.zhiwei.qbot.ui.GuideScreen
 import com.zhiwei.qbot.ui.HomeScreen
 import com.zhiwei.qbot.ui.LogsScreen
 import com.zhiwei.qbot.ui.MenusScreen
+import com.zhiwei.qbot.ui.MemoryScreen
 import com.zhiwei.qbot.ui.PermsScreen
 import com.zhiwei.qbot.ui.PersonaScreen
 import com.zhiwei.qbot.ui.QbotTheme
@@ -48,9 +50,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 退到后台时把防抖中的配置落盘，避免进程被回收时丢最后几笔设置 */
+    /** 退到后台时把防抖中的配置与记忆落盘，避免进程被回收时丢最后几笔设置 */
     override fun onStop() {
         runCatching { Prefs.saveNow() }
+        runCatching { Memory.saveNow() }
         super.onStop()
     }
 }
@@ -58,7 +61,7 @@ class MainActivity : ComponentActivity() {
 /** 二级页（带返回箭头，底栏隐藏） */
 private val SUB_PAGES = setOf(
     "connect", "persona", "send", "ai", "voice", "stickers", "files",
-    "menus", "perms", "logs", "guide", "about"
+    "menus", "memory", "perms", "logs", "guide", "about"
 )
 
 @Composable
@@ -90,6 +93,7 @@ private fun AppRoot() {
                 "stickers" -> StickersScreen(onBack = { route = backTo })
                 "files" -> FilesScreen(onBack = { route = backTo })
                 "menus" -> MenusScreen(onBack = { route = backTo })
+                "memory" -> MemoryScreen(onBack = { route = backTo })
                 "perms" -> PermsScreen(onBack = { route = backTo })
                 "logs" -> LogsScreen(onBack = { route = backTo })
                 "guide" -> GuideScreen(onBack = { route = backTo }, onOpen = open)
