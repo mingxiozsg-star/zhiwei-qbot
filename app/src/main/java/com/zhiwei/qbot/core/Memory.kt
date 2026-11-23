@@ -211,6 +211,31 @@ object Memory {
         }
     }
 
+    /** 导出完整记忆库（备份用） */
+    fun exportJson(): String = synchronized(lock) {
+        val arr = JSONArray()
+        people.values.forEach { arr.put(it.toJson()) }
+        JSONObject().put("version", 2).put("people", arr).toString(2)
+    }
+
+    /** 从备份导入，整体替换当前记忆库 */
+    fun importJson(text: String): Result<Unit> = runCatching {
+        val obj = JSONObject(text)
+        val arr = obj.optJSONArray("people") ?: JSONArray()
+        synchronized(lock) {
+            people.clear()
+            idIndex.clear()
+            for (i in 0 until arr.length()) {
+                val p = arr.optJSONObject(i)?.let { Person.from(it) } ?: continue
+                if (p.openId.isBlank()) continue
+                people[p.openId] = p
+                idIndex[p.openId] = p.openId
+                p.aliasIds.forEach { a -> if (a.isNotBlank()) idIndex[a] = p.openId }
+            }
+        }
+        saveNow()
+    }
+
     /** 写盘节流：频繁聊天时最多 8 秒落一次，退出前再强制一次 */
     private fun scheduleSave() {
         synchronized(lock) {

@@ -20,6 +20,11 @@
 - 发整个目录：模型输出 `[目录:/sdcard/Download/资料]`，或管理员 `/文件 /sdcard/Download/资料`，目录里的文件逐个发，并汇报成功与失败数量。
 - 状态查询：`/状态` 给出确切信息——运行平台、机型、系统、电量、内存、存储、运行时长、线路、收发计数与记忆统计。
 - 保活引导：通知、电池白名单、自启动、后台弹出、访问所有文件，逐项检测 + 一键跳转。
+- 双进程保活：主服务之外的 `:guard` 独立进程，每 20 秒确认主服务还在不在，被系统回收就拉回来；主服务自己的看门狗跟着一起死，所以必须有第二个进程。
+- 快捷指令自定义：触发词、说明、动作、参数全部可在应用内增删改查与启停，出厂带 `q`/`w`/`e`/`s`/`目录`/`备份`/`状态`；指令表同时拼进系统提示词，模型知道有哪些指令、能干什么，你说「用 q 列一下目录」它不会再当普通聊天。
+- 模型按用途分配：普通对话、复杂推理（师徒模型）、语音稿、画图四栏可各填 BaseURL / Key / 模型名，留空自动回落到主模型——「普通模型能顶替就不用填」。长句或多步请求自动切到推理栏，每栏都能单独测通。
+- 备份与恢复：配置、记忆库、全部对话、表情原图打成一个 zip 存到 `/sdcard/ZhiweiQBot`，换机或重装时一键覆盖还原，也可从任意路径导入。
+- 看目录不再发文件：说「看/列一下某目录」只回紧凑文件清单（名字、大小、时间），不再把文件本身推给你；「内部存储」「下载」这类口语路径直接映射到真实目录。
 
 **快速开始**
 
@@ -79,9 +84,9 @@
 - 处理：同一会话串行，全局最多 4 个模型请求；模型失败重试 3 次，全失败才回一句人话。
 - 兜底：前台服务守护协程 45 秒巡检，网关死了就拉；通知栏有「重连」「停止」；崩溃前先落盘配置并写日志；配置 500ms 防抖 + 退到后台立即落盘；日志留 300 条。
 
-**构建**：`./gradlew assembleDebug` / `assembleRelease`。签名走环境变量 `KEYSTORE_FILE`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`，没有 keystore 时回退 debug 签名。推 `v*` 标签由 GitHub Actions 构建并发布。JDK 17 / compileSdk 35 / minSdk 24。
+**构建**：`./gradlew assembleDebug` / `assembleRelease`。签名走环境变量 `KEYSTORE_FILE`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`，**找不到正式密钥时构建直接失败**——换签名的包会导致旧版无法覆盖安装、用户必须卸载重装并丢数据，所以绝不允许回退 debug 签名。包名固定 `com.zhiwei.qbot`，不得更改。推 `v*` 标签由 GitHub Actions 构建并发布。JDK 17 / compileSdk 35 / minSdk 24。
 
-**边界**：同一条消息被动回复最多 5 次，分句段数加媒体别超；群聊要 @ 机器人；按钮消息必须走 markdown，且自定义按钮是开放平台「内邀」能力、模板按钮需申请，没开通时自动退回纯文字菜单；不是外挂，不做账号登录，不绕过平台限制；模型说的话由模型负责，先自己测几句。
+**边界**：同一条消息被动回复最多 5 次，超过后自动改发主动消息继续（不再中断、不再虚报失败）；群聊要 @ 机器人；按钮消息必须走 markdown，且自定义按钮是开放平台「内邀」能力、模板按钮需申请，没开通时自动退回纯文字菜单；不是外挂，不做账号登录，不绕过平台限制；模型说的话由模型负责，先自己测几句。
 
 **许可**：MIT。QQ 接口的使用需遵守《QQ 开放平台开发者服务协议》。
 
@@ -102,6 +107,11 @@ Bring your own model to QQ's official bot API. Your persona — with real emotio
 - Whole directories: `[dir:/sdcard/Download/stuff]` from the model, or `/file /sdcard/Download/stuff` for admins — files go out one by one with a summary of what succeeded.
 - Status: `/status` reports exact info — platform, model, OS, battery, memory, storage, uptime, route, counters and memory stats.
 - Keep‑alive help: notifications, battery whitelist, autostart, background pop‑up, all‑files access — status check plus a jump to the right settings page.
+- Two‑process keep‑alive: an independent `:guard` process checks every 20s whether the main service is still alive and revives it after a kill. The main service's own watchdog dies with it, so a second process is the only thing that can bring it back.
+- Custom shortcuts: trigger word, description, action and argument are all editable in‑app, with enable/disable. Ships with `q`/`w`/`e`/`s`/`目录`/`备份`/`状态`; the same table is injected into the system prompt, so the model knows the shortcuts exist and won't treat "run q for me" as small talk.
+- Per‑purpose models: plain chat, complex reasoning (a stronger "mentor" model), voice script, and image generation each take their own BaseURL / key / model. Leave a slot empty and it falls back to the main model — fill only what you actually need. Long or multi‑step requests are routed to the reasoning slot automatically, and each slot has its own connectivity test.
+- Backup & restore: config, memory, full conversation history and original sticker files packed into one zip under `/sdcard/ZhiweiQBot`; restore with one tap on a new device, or import from any path.
+- Listing is not sending: asking to "look at / list a folder" returns a compact listing (name, size, time) instead of pushing the files themselves; colloquial paths like "internal storage" or "downloads" map to the real directories.
 
 **Quick start**
 
@@ -157,9 +167,9 @@ Admins go in “Connection → admin openid”, comma separated; empty means eve
 - Handling: one conversation at a time, at most 4 model calls at once; a failed model call is retried 3 times before a short apology.
 - Safety nets: the foreground service re‑arms the gateway every 45s, the notification has “Reconnect” and “Stop”, crashes persist config and log the reason first, config is debounced 500ms and flushed on background, logs capped at 300 lines.
 
-**Build**: `./gradlew assembleDebug` or `assembleRelease`. Signing reads `KEYSTORE_FILE`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`; without a keystore it falls back to the debug key. Pushing a `v*` tag builds and publishes via GitHub Actions. JDK 17 / compileSdk 35 / minSdk 24.
+**Build**: `./gradlew assembleDebug` or `assembleRelease`. Signing reads `KEYSTORE_FILE`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`; **the build fails outright when no release keystore is present** — a differently signed package can't be installed over the old one, forcing users to uninstall and lose data, so falling back to the debug key is never allowed. The package name is fixed at `com.zhiwei.qbot`. Pushing a `v*` tag builds and publishes via GitHub Actions. JDK 17 / compileSdk 35 / minSdk 24.
 
-**Limits**: at most 5 passive replies per message, so keep split segments plus media under that; groups need an @mention; button messages must be markdown, custom buttons are an invite‑only capability and template buttons need approval — without them the menu falls back to plain text; this is not a plugin hack, it does no account login and bypasses nothing; whatever the model says is on the model — test it first.
+**Limits**: at most 5 passive replies per message — beyond that sends switch to active messages automatically (no more truncation or phantom failures); groups need an @mention; button messages must be markdown, custom buttons are an invite‑only capability and template buttons need approval — without them the menu falls back to plain text; this is not a plugin hack, it does no account login and bypasses nothing; whatever the model says is on the model — test it first.
 
 **License**: MIT. Using the QQ API means following the QQ Open Platform developer agreement.
 

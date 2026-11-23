@@ -45,6 +45,16 @@ class BotService : Service() {
         private const val NOTIFY_ID = 1001
 
         fun start(context: Context) {
+            // 主服务与守护一起起来：守护在独立进程，负责主进程被回收后把它拉回来
+            GuardService.start(context)
+            startWithoutGuard(context)
+        }
+
+        /**
+         * 只拉主服务，不动守护。
+         * 守护进程内部调它，避免「守护拉起主服务 → 主服务又去拉起守护」的循环调用。
+         */
+        fun startWithoutGuard(context: Context) {
             val intent = Intent(context, BotService::class.java).setAction(ACTION_START)
             runCatching {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -56,6 +66,8 @@ class BotService : Service() {
         }
 
         fun stop(context: Context) {
+            // 先关守护，否则它 20 秒后会把刚停掉的机器人又拉起来
+            GuardService.stop(context)
             runCatching {
                 context.startService(Intent(context, BotService::class.java).setAction(ACTION_STOP))
             }.onFailure {

@@ -57,6 +57,18 @@
                 android:value="qq_bot_gateway" />
         </service>
 
+        <!-- 守护进程：独立 :guard 子进程，主进程被杀时把它拉回来 -->
+        <service
+            android:name=".bot.GuardService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:process=":guard"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="qq_bot_guard" />
+        </service>
+
         <receiver
             android:name=".bot.BootReceiver"
             android:enabled="true"

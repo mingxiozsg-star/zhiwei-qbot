@@ -19,6 +19,7 @@ import com.zhiwei.qbot.core.Memory
 import com.zhiwei.qbot.core.Prefs
 import com.zhiwei.qbot.ui.AboutScreen
 import com.zhiwei.qbot.ui.AiScreen
+import com.zhiwei.qbot.ui.BackupScreen
 import com.zhiwei.qbot.ui.BgBottom
 import com.zhiwei.qbot.ui.BottomBar
 import com.zhiwei.qbot.ui.ConnectScreen
@@ -31,8 +32,10 @@ import com.zhiwei.qbot.ui.MemoryScreen
 import com.zhiwei.qbot.ui.PermsScreen
 import com.zhiwei.qbot.ui.PersonaScreen
 import com.zhiwei.qbot.ui.QbotTheme
+import com.zhiwei.qbot.ui.RoutingScreen
 import com.zhiwei.qbot.ui.SendScreen
 import com.zhiwei.qbot.ui.SettingsScreen
+import com.zhiwei.qbot.ui.ShortcutsScreen
 import com.zhiwei.qbot.ui.SimpleDialog
 import com.zhiwei.qbot.ui.StickersScreen
 import com.zhiwei.qbot.ui.TalkScreen
@@ -61,7 +64,8 @@ class MainActivity : ComponentActivity() {
 /** 二级页（带返回箭头，底栏隐藏） */
 private val SUB_PAGES = setOf(
     "connect", "persona", "send", "ai", "voice", "stickers", "files",
-    "menus", "memory", "perms", "logs", "guide", "about"
+    "menus", "memory", "perms", "logs", "guide", "about",
+    "shortcuts", "routing", "backup"
 )
 
 @Composable
@@ -94,6 +98,9 @@ private fun AppRoot() {
                 "files" -> FilesScreen(onBack = { route = backTo })
                 "menus" -> MenusScreen(onBack = { route = backTo })
                 "memory" -> MemoryScreen(onBack = { route = backTo })
+                "shortcuts" -> ShortcutsScreen(onBack = { route = backTo })
+                "routing" -> RoutingScreen(onBack = { route = backTo })
+                "backup" -> BackupScreen(onBack = { route = backTo })
                 "perms" -> PermsScreen(onBack = { route = backTo })
                 "logs" -> LogsScreen(onBack = { route = backTo })
                 "guide" -> GuideScreen(onBack = { route = backTo }, onOpen = open)

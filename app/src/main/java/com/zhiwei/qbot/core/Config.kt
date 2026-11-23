@@ -140,6 +140,93 @@ data class TtsConfig(
     }
 }
 
+/* ---------------- 模型分配 ---------------- */
+
+/**
+ * 按用途分配模型。
+ *
+ * 每一项都可以单独填 BaseURL / Key / 模型名；
+ * 留空就自动回落到「普通对话」那一组，所以只想填一组的人不会被逼着填四遍。
+ */
+data class ModelSlot(
+    /** 留空则用全局默认（普通对话） */
+    val baseUrl: String = "",
+    val apiKey: String = "",
+    val model: String = "",
+    val temperature: Double = 0.85,
+    val maxTokens: Int = 400
+) {
+    val filled: Boolean get() = model.isNotBlank() && baseUrl.isNotBlank()
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("baseUrl", baseUrl)
+        .put("apiKey", apiKey)
+        .put("model", model)
+        .put("temperature", temperature)
+        .put("maxTokens", maxTokens)
+
+    companion object {
+        fun from(o: JSONObject) = ModelSlot(
+            baseUrl = o.str("baseUrl"),
+            apiKey = o.str("apiKey"),
+            model = o.str("model"),
+            temperature = o.dbl("temperature", 0.85),
+            maxTokens = o.num("maxTokens", 400)
+        )
+    }
+}
+
+/**
+ * 四类用途的模型。
+ *
+ * - [chat]：普通对话（必填，其它空着都回落到它）
+ * - [subagent]：复杂任务/多步推理，比如「列出目录再挑一个发给我」
+ * - [tts]：语音生成
+ * - [image]：画图
+ */
+data class ModelRouting(
+    val enabled: Boolean = false,
+    val chat: ModelSlot = ModelSlot(),
+    val subagent: ModelSlot = ModelSlot(),
+    val tts: ModelSlot = ModelSlot(),
+    val image: ModelSlot = ModelSlot()
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("enabled", enabled)
+        .put("chat", chat.toJson())
+        .put("subagent", subagent.toJson())
+        .put("tts", tts.toJson())
+        .put("image", image.toJson())
+
+    /**
+     * 取某一用途实际生效的配置。
+     * 空着的项一律回落到 [fallback]（普通对话），这就是「普通模型能顶替就不用填」。
+     */
+    fun effective(slot: ModelSlot, fallback: AiConfig): AiConfig {
+        if (!slot.filled) return fallback
+        return AiConfig(
+            baseUrl = slot.baseUrl.trim(),
+            apiKey = slot.apiKey.trim().ifBlank { fallback.apiKey },
+            model = slot.model.trim(),
+            temperature = slot.temperature,
+            maxTokens = slot.maxTokens,
+            history = fallback.history,
+            timeoutSec = fallback.timeoutSec,
+            extraPrompt = fallback.extraPrompt
+        )
+    }
+
+    companion object {
+        fun from(o: JSONObject) = ModelRouting(
+            enabled = o.flag("enabled"),
+            chat = ModelSlot.from(o.obj("chat")),
+            subagent = ModelSlot.from(o.obj("subagent")),
+            tts = ModelSlot.from(o.obj("tts")),
+            image = ModelSlot.from(o.obj("image"))
+        )
+    }
+}
+
 /* ---------------- 发送行为 ---------------- */
 
 data class SendConfig(
@@ -329,6 +416,8 @@ data class Config(
     val tts: TtsConfig = TtsConfig(),
     val send: SendConfig = SendConfig(),
     val memory: MemoryConfig = MemoryConfig(),
+    val routing: ModelRouting = ModelRouting(),
+    val shortcuts: List<Shortcut> = emptyList(),
     val menus: List<MenuDef> = defaultMenus(),
     val stickers: List<Sticker> = emptyList(),
     val aiGroup: Boolean = true,
@@ -358,6 +447,8 @@ data class Config(
             .put("tts", tts.toJson())
             .put("send", send.toJson())
             .put("memory", memory.toJson())
+            .put("routing", routing.toJson())
+            .put("shortcuts", Shortcuts.toJson(this@Config))
             .put("menus", ma)
             .put("stickers", sa)
             .put("aiGroup", aiGroup)
@@ -377,6 +468,9 @@ data class Config(
             val stickers = ArrayList<Sticker>()
             val sa = o.arr("stickers")
             for (i in 0 until sa.length()) sa.optJSONObject(i)?.let { stickers.add(Sticker.from(it)) }
+            val shortcuts = ArrayList<Shortcut>()
+            val sca = o.arr("shortcuts")
+            for (i in 0 until sca.length()) sca.optJSONObject(i)?.let { shortcuts.add(Shortcut.from(it)) }
             return Config(
                 appId = o.str("appId"),
                 appSecret = o.str("appSecret"),
@@ -391,6 +485,8 @@ data class Config(
                 tts = TtsConfig.from(o.obj("tts")),
                 send = SendConfig.from(o.obj("send")),
                 memory = MemoryConfig.from(o.obj("memory")),
+                routing = ModelRouting.from(o.obj("routing")),
+                shortcuts = shortcuts,
                 menus = if (menus.isEmpty()) defaultMenus() else menus,
                 stickers = stickers,
                 aiGroup = o.flag("aiGroup", true),

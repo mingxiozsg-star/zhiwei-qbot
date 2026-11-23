@@ -2,6 +2,7 @@ package com.zhiwei.qbot
 
 import android.app.Application
 import android.os.Process
+import com.zhiwei.qbot.core.Backup
 import com.zhiwei.qbot.core.Logs
 import com.zhiwei.qbot.core.Memory
 import com.zhiwei.qbot.core.Prefs
@@ -15,6 +16,7 @@ class QbotApp : Application() {
         Prefs.init(this)
         Store.init(this)
         Memory.init(this)
+        Backup.init(this)
         DeviceInfo.init(this)
         installCrashHandler()
     }

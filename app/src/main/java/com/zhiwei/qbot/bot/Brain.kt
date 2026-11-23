@@ -1,9 +1,12 @@
 package com.zhiwei.qbot.bot
 
+import com.zhiwei.qbot.core.Backup
 import com.zhiwei.qbot.core.Config
 import com.zhiwei.qbot.core.Logs
 import com.zhiwei.qbot.core.Memory
 import com.zhiwei.qbot.core.Prefs
+import com.zhiwei.qbot.core.Shortcut
+import com.zhiwei.qbot.core.Shortcuts
 import com.zhiwei.qbot.core.Sticker
 import com.zhiwei.qbot.net.AiApi
 import com.zhiwei.qbot.net.QqApi
@@ -419,25 +422,28 @@ object Brain {
     /* ---------------- 快捷指令 ---------------- */
 
     /**
-     * 单字母快捷指令，聊天里直接敲：
-     * - `q [目录]`      看本地文件列表，不给目录就看 /sdcard
-     * - `w [关键词]`    扫安装包（apk）
-     * - `e 路径/文件名`  直接把 apk 发出去
-     * - `s 目录 文件名`  把压缩包（或任意文件）发出去
+     * 快捷指令入口。
      *
-     * 另外还认「发送某某文档 / 照片 / 视频 / 压缩包 + 路径」这种自然说法。
-     * 返回 true 表示已经处理，不再进 AI。
+     * 触发词不再写死在代码里，而是从 [Shortcuts] 表里查：
+     * 用户在设置页加的、改的、禁用的，这里立刻生效，AI 提示词里看到的也是同一份表。
+     *
+     * 内置动作（列目录/扫 apk/发文件/发目录/备份/状态）走固定实现，
+     * 自定义条目可以指定任一种动作，也可以干脆交给 AI。
      */
     private fun handleShortcut(text: String, conv: Conversation, senderId: String): Boolean {
         val raw = text.trim()
         if (raw.isEmpty()) return false
-        val lower = raw.lowercase(Locale.US)
-        val cmd = lower.substringBefore(' ').trim()
+        val cfg = Prefs.current
+        val word = raw.substringBefore(' ').trim()
         val arg = raw.substringAfter(' ', "").trim()
+        // 中文触发词可能是整句（「目录」「备份」），所以整句也要试着匹配一次
+        val hit = Shortcuts.match(cfg, word) ?: Shortcuts.match(cfg, raw)
+        if (hit == null) return handleNaturalSend(raw, conv, senderId)
+        val param = if (hit.trigger.equals(word, true)) arg else ""
 
-        when (cmd) {
-            "q" -> {
-                val target = arg.ifBlank { "/sdcard" }
+        when (hit.action) {
+            Shortcut.ACTION_LIST_DIR -> {
+                val target = param.ifBlank { hit.arg.ifBlank { "/sdcard" } }
                 scope.launch {
                     val body = runCatching { FileBrowser.listDirectory(target) }
                         .getOrElse { "列不出来：${it.message}" }
@@ -445,16 +451,17 @@ object Brain {
                 }
                 return true
             }
-            "w" -> {
+            Shortcut.ACTION_FIND_APK -> {
                 if (!canSendFile(senderId)) {
                     Sender.sendText(conv, "发文件只有管理员能用。")
                     return true
                 }
+                val key = param.ifBlank { hit.arg }
                 scope.launch {
                     val body = runCatching {
-                        val list = if (arg.isBlank()) FileBrowser.findApks() else FileBrowser.findApks(arg)
+                        val list = if (key.isBlank()) FileBrowser.findApks() else FileBrowser.findApks(key)
                         if (list.isEmpty()) {
-                            "没扫到安装包。" + (if (arg.isBlank()) "试试指定目录：w /sdcard/Download" else "换个关键词：w 微信")
+                            "没扫到安装包。" + (if (key.isBlank()) "试试指定目录：${hit.trigger} /sdcard/Download" else "换个关键词：${hit.trigger} 微信")
                         } else {
                             buildString {
                                 append("📦 找到 ").append(list.size).append(" 个安装包：\n")
@@ -471,32 +478,70 @@ object Brain {
                 }
                 return true
             }
-            "e" -> {
+            Shortcut.ACTION_SEND_APK -> {
                 if (!canSendFile(senderId)) {
                     Sender.sendText(conv, "发安装包只有管理员能用。")
                     return true
                 }
-                if (arg.isBlank()) {
-                    Sender.sendText(conv, "写法：e /sdcard/Download/app.apk\n或：e /sdcard/Download app.apk\n不知道有啥就先发 w")
+                val target = param.ifBlank { hit.arg }
+                if (target.isBlank()) {
+                    Sender.sendText(conv, "写法：${hit.trigger} /sdcard/Download/app.apk\n或：${hit.trigger} /sdcard/Download app.apk")
                     return true
                 }
-                scope.launch { sendByArg(conv, arg, preferApk = true) }
+                scope.launch { sendByArg(conv, target, preferApk = true) }
                 return true
             }
-            "s" -> {
+            Shortcut.ACTION_SEND_FILE -> {
                 if (!canSendFile(senderId)) {
                     Sender.sendText(conv, "发文件只有管理员能用。")
                     return true
                 }
-                if (arg.isBlank()) {
-                    Sender.sendText(conv, "写法：s /sdcard/Download 资料.zip\n或：s /sdcard/Download/a.zip")
+                val target = param.ifBlank { hit.arg }
+                if (target.isBlank()) {
+                    Sender.sendText(conv, "写法：${hit.trigger} /sdcard/Download/资料.zip")
                     return true
                 }
-                scope.launch { sendByArg(conv, arg, preferApk = false) }
+                scope.launch { sendByArg(conv, target, preferApk = false) }
                 return true
             }
+            Shortcut.ACTION_SEND_DIR -> {
+                if (!canSendFile(senderId)) {
+                    Sender.sendText(conv, "发目录只有管理员能用。")
+                    return true
+                }
+                val target = param.ifBlank { hit.arg }
+                if (target.isBlank()) {
+                    Sender.sendText(conv, "写法：${hit.trigger} /sdcard/Download/某个文件夹")
+                    return true
+                }
+                scope.launch { Sender.sendDirectory(conv, FileBrowser.resolve(target)) }
+                return true
+            }
+            Shortcut.ACTION_BACKUP -> {
+                if (!isOwner(senderId)) {
+                    Sender.sendText(conv, "备份只有管理员能做。")
+                    return true
+                }
+                scope.launch {
+                    val r = runCatching { Backup.backup().getOrThrow() }
+                    if (r.isSuccess) {
+                        val f = r.getOrThrow()
+                        Sender.sendText(conv, "已备份：\n${f.absolutePath}\n${FileBrowser.sizeOf(f)}")
+                    } else {
+                        Sender.sendText(conv, "备份失败：${r.exceptionOrNull()?.message}")
+                    }
+                }
+                return true
+            }
+            Shortcut.ACTION_STATUS -> {
+                Sender.sendText(conv, statusText())
+                return true
+            }
+            else -> {
+                // 交给 AI 的指令：把整句继续往下走
+                return handleNaturalSend(raw, conv, senderId)
+            }
         }
-        return handleNaturalSend(raw, conv, senderId)
     }
 
     private fun canSendFile(senderId: String): Boolean =
@@ -632,11 +677,47 @@ object Brain {
         }
         sb.append(rule++).append(". 想发本机图片时，单独一行写 [图片:/sdcard/xxx.jpg]。\n")
         sb.append(rule++).append(". 想发本机文件时，单独一行写 [文件:/sdcard/xxx.pdf]，一次最多一个。\n")
-        sb.append(rule++).append(". 想发一整个目录时，单独一行写 [目录:/sdcard/Download/某个文件夹]。\n")
+        sb.append(rule++).append(". 想把整个文件夹里的文件全发给对方，才写 [目录:/sdcard/Download/某个文件夹]，一次最多一个。\n")
+        sb.append(rule++).append(". 对方只是想「看看/列出/有什么文件」时，绝对不要用 [目录:] 或 [文件:]——")
+            .append("那会真的把文件发出去。这种时候单独一行写 [列目录:路径]，系统会把清单贴出来。\n")
         sb.append(rule).append(". 不要输出 Markdown、不要列清单、不要用标题。\n")
+
+        // 路径别名：模型不知道「内部存储」是什么，把能用的口语一次性喂给它
+        sb.append("\n【路径写法】本机路径一律用绝对路径，常用根目录：")
+            .append("/sdcard（也可写「").append(FileBrowser.aliasHint()).append("」）\n")
+        sb.append("找不到路径时不要瞎猜，先写 [列目录:/sdcard] 看真实内容。\n")
+
+        // 快捷指令：让模型看得见、会主动推荐，而不是把它当成普通聊天
+        val shortcuts = Shortcuts.promptBlock(cfg)
+        if (shortcuts.isNotBlank()) {
+            sb.append("\n【现在的快捷指令】对方可以直接发这些词，系统会自己处理，你不用模仿也不要复述：\n")
+            sb.append(shortcuts).append('\n')
+            sb.append("对方问「有什么快捷指令」时，就照上面的列表答。想让他用某条指令时，直接说指令名，别解释原理。\n")
+        }
+
         if (p.extra.isNotBlank()) sb.append("补充设定：").append(p.extra).append('\n')
         if (cfg.ai.extraPrompt.isNotBlank()) sb.append("额外要求：").append(cfg.ai.extraPrompt).append('\n')
         return sb.toString()
+    }
+
+    /**
+     * 按用途挑模型。
+     *
+     * 复杂请求（多步、带「然后/再/顺便」、同时提到查和发）走 subagent 槽位，
+     * 其余走 chat 槽位；某个槽位没填时 [ModelRouting.effective] 自动回落到全局模型。
+     */
+    private fun modelFor(cfg: Config, text: String, complex: Boolean = false): com.zhiwei.qbot.core.AiConfig {
+        if (!cfg.routing.enabled) return cfg.ai
+        val slot = if (complex || looksComplex(text)) cfg.routing.subagent else cfg.routing.chat
+        return runCatching { cfg.routing.effective(slot, cfg.ai) }.getOrDefault(cfg.ai)
+    }
+
+    private val complexHints = listOf("然后", "接着", "再帮我", "顺便", "并且", "之后", "先", "再发", "再列", "全部", "所有")
+
+    private fun looksComplex(text: String): Boolean {
+        if (text.length > 80) return true
+        val hits = complexHints.count { text.contains(it, true) }
+        return hits >= 2
     }
 
     /** 当前说话人的资料 + 提炼记忆 + 相关原始对话，直接拼进系统提示词 */
@@ -717,12 +798,13 @@ object Brain {
         val key = convKey(conv)
         val messages = buildMessages(cfg, key, text, memKey, senderName, conv.isGroup)
         val started = System.currentTimeMillis()
+        val chatCfg = modelFor(cfg, text)
         var reply: String? = null
         var lastError = ""
         aiGate.withPermit {
             for (attempt in 1..3) {
                 try {
-                    reply = AiApi.chat(messages, cfg.ai)
+                    reply = AiApi.chat(messages, chatCfg)
                     return@withPermit
                 } catch (e: Exception) {
                     lastError = e.message ?: "未知错误"
@@ -770,13 +852,16 @@ object Brain {
         class VoicePiece(val text: String) : Piece()
         class FilePiece(val path: String) : Piece()
         class DirPiece(val path: String) : Piece()
+        /** 只贴清单，不发文件 —— 「让它列目录却把文件发过来」的根治点 */
+        class ListPiece(val path: String) : Piece()
     }
 
     private val markerRe = Regex(
         "\\[(?:表情|表情包|贴纸)\\s*[:：]\\s*([^\\]]+)]" +
             "|\\[(?:文件|图片)\\s*[:：]\\s*([^\\]]+)]" +
             "|\\[目录\\s*[:：]\\s*([^\\]]+)]" +
-            "|\\[语音\\]\\s*([^\\n\\[]*)"
+            "|\\[语音\\]\\s*([^\\n\\[]*)" +
+            "|\\[(?:列目录|目录清单|看看目录)\\s*[:：]?\\s*([^\\]\\n]*)]"
     )
 
     private fun parsePieces(reply: String): List<Piece> {
@@ -791,11 +876,13 @@ object Brain {
             val file = match.groupValues[2]
             val dir = match.groupValues[3]
             val voice = match.groupValues[4]
+            val listing = match.groupValues[5]
             when {
                 sticker.isNotBlank() -> out.add(Piece.StickerPiece(sticker))
                 file.isNotBlank() -> out.add(Piece.FilePiece(file))
                 dir.isNotBlank() -> out.add(Piece.DirPiece(dir))
                 voice.isNotBlank() -> out.add(Piece.VoicePiece(voice))
+                listing.isNotBlank() -> out.add(Piece.ListPiece(listing))
             }
             cursor = match.range.last + 1
         }
@@ -869,6 +956,14 @@ object Brain {
                     }
                     totalSent++
                     delay(500)
+                }
+                is Piece.ListPiece -> {
+                    val target = piece.path.ifBlank { "/sdcard" }
+                    val body = runCatching { FileBrowser.compactList(target) }
+                        .getOrElse { "列不出来：${it.message}" }
+                    Sender.sendText(conv, body)
+                    totalSent++
+                    delay(300)
                 }
             }
         }
